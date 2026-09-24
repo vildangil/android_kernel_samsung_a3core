@@ -1,0 +1,211 @@
+name: Build A03 Core ReSukiSU + SUSFS
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_branch:
+        description: 'Device kernel branch to build'
+        required: true
+        default: 'stable'
+        type: string
+      resukisu_ref:
+        description: 'ReSukiSU ref (blank = latest main)'
+        required: false
+        default: ''
+        type: string
+  schedule:
+    - cron: '17 3 * * 0'
+  pull_request:
+    paths:
+      - '.github/workflows/build-resukisu-susfs.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    env:
+      ARCH: arm64
+      BSP_BUILD_FAMILY: sharkl3
+      KERNEL_ROOT: ${{ github.workspace }}/kernel
+
+    steps:
+      - name: Checkout workflow revision
+        uses: actions/checkout@v4
+        with:
+          path: workflow-src
+          fetch-depth: 1
+
+      - name: Resolve refs
+        shell: bash
+        run: |
+          set -euo pipefail
+          SOURCE_BRANCH='${{ inputs.source_branch }}'
+          if [ -z "$SOURCE_BRANCH" ]; then SOURCE_BRANCH='stable'; fi
+          RESUKISU_REF='${{ inputs.resukisu_ref }}'
+          echo "SOURCE_BRANCH=$SOURCE_BRANCH" >> "$GITHUB_ENV"
+          echo "RESUKISU_REF=$RESUKISU_REF" >> "$GITHUB_ENV"
+
+      - name: Checkout device kernel
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SOURCE_BRANCH }}
+          path: kernel
+          fetch-depth: 1
+
+      - name: Restore KSU-touched files from stock
+        shell: bash
+        working-directory: kernel
+        run: |
+          set -euxo pipefail
+          git fetch --depth 1 origin stock
+          git checkout FETCH_HEAD -- \
+            arch/arm64/configs/a3core_eur_open_defconfig \
+            drivers/Kconfig drivers/Makefile drivers/input/input.c \
+            fs/devpts/inode.c fs/exec.c fs/namespace.c fs/open.c \
+            fs/read_write.c fs/stat.c
+          rm -f drivers/kernelsu
+          rm -rf KernelSU KernelSU-Next susfs4ksu
+          git status --short
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential ccache cpio curl flex git libelf-dev \
+            libncurses-dev libssl-dev lz4 make patch python3 rsync unzip \
+            xz-utils zip gcc-aarch64-linux-gnu gcc-arm-linux-gnueabihf
+
+      - name: Install Android Clang r383902b
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/toolchains/clang-r383902b"
+          curl -L --fail --retry 3 \
+            'https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/0e9e7035bf8ad42437c6156e5950eab13655b26c/clang-r383902b.tar.gz' \
+            -o "$RUNNER_TEMP/clang.tar.gz"
+          tar -xzf "$RUNNER_TEMP/clang.tar.gz" -C "$GITHUB_WORKSPACE/toolchains/clang-r383902b"
+          echo "$GITHUB_WORKSPACE/toolchains/clang-r383902b/bin" >> "$GITHUB_PATH"
+
+      - name: Integrate latest ReSukiSU
+        shell: bash
+        working-directory: kernel
+        run: |
+          set -euxo pipefail
+          if [ -n "$RESUKISU_REF" ]; then
+            curl -LSs 'https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh' | bash -s "$RESUKISU_REF"
+          else
+            curl -LSs 'https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh' | bash
+          fi
+          git -C KernelSU rev-parse HEAD | tee "$RUNNER_TEMP/resukisu.sha"
+          test -f drivers/kernelsu/Kconfig
+
+      - name: Integrate latest SUSFS for Linux 4.14
+        shell: bash
+        working-directory: kernel
+        run: |
+          set -euxo pipefail
+          git clone --depth 1 --branch kernel-4.14 https://gitlab.com/simonpunk/susfs4ksu.git susfs4ksu
+          git -C susfs4ksu rev-parse HEAD | tee "$RUNNER_TEMP/susfs.sha"
+          cp -a susfs4ksu/kernel_patches/fs/. fs/
+          cp -a susfs4ksu/kernel_patches/include/linux/. include/linux/
+          patch -p1 --forward < susfs4ksu/kernel_patches/50_add_susfs_in_kernel-4.14.patch
+
+      - name: Configure kernel
+        shell: bash
+        working-directory: kernel
+        env:
+          CROSS_COMPILE: aarch64-linux-gnu-
+          CROSS_COMPILE_ARM32: arm-linux-gnueabihf-
+          CLANG_TRIPLE: aarch64-linux-gnu-
+        run: |
+          set -euxo pipefail
+          export PATH="$GITHUB_WORKSPACE/toolchains/clang-r383902b/bin:$PATH"
+          export DTC_OVERLAY_TEST_EXT="$PWD/tools/mkdtimg/ufdt_apply_overlay"
+          export DTC_OVERLAY_VTS_EXT="$PWD/tools/mkdtimg/ufdt_verify_overlay_host"
+          export BSP_BUILD_ANDROID_OS=y
+          make O=out BSP_BUILD_DT_OVERLAY=y CC=clang LD=ld.lld ARCH=arm64 \
+            CLANG_TRIPLE="$CLANG_TRIPLE" CROSS_COMPILE="$CROSS_COMPILE" \
+            CROSS_COMPILE_ARM32="$CROSS_COMPILE_ARM32" a3core_eur_open_defconfig
+          chmod +x scripts/config
+          scripts/config --file out/.config -e KSU
+          scripts/config --file out/.config -e KSU_SUSFS
+          scripts/config --file out/.config -d KSU_MANUAL_HOOK || true
+          scripts/config --file out/.config -d KSU_TRACEPOINT_HOOK || true
+          scripts/config --file out/.config -d KSU_DEBUG || true
+          scripts/config --file out/.config -e KSU_SUSFS_SUS_PATH || true
+          scripts/config --file out/.config -e KSU_SUSFS_SUS_MOUNT || true
+          scripts/config --file out/.config -e KSU_SUSFS_SUS_KSTAT || true
+          scripts/config --file out/.config -e KSU_SUSFS_SPOOF_UNAME || true
+          scripts/config --file out/.config -e KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS || true
+          scripts/config --file out/.config -e KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG || true
+          scripts/config --file out/.config -e KSU_SUSFS_OPEN_REDIRECT || true
+          make O=out ARCH=arm64 olddefconfig
+          grep -E '^CONFIG_KSU|^# CONFIG_KSU' out/.config || true
+
+      - name: Build kernel
+        shell: bash
+        working-directory: kernel
+        env:
+          CROSS_COMPILE: aarch64-linux-gnu-
+          CROSS_COMPILE_ARM32: arm-linux-gnueabihf-
+          CLANG_TRIPLE: aarch64-linux-gnu-
+        run: |
+          set -euxo pipefail
+          export PATH="$GITHUB_WORKSPACE/toolchains/clang-r383902b/bin:$PATH"
+          export DTC_OVERLAY_TEST_EXT="$PWD/tools/mkdtimg/ufdt_apply_overlay"
+          export DTC_OVERLAY_VTS_EXT="$PWD/tools/mkdtimg/ufdt_verify_overlay_host"
+          export BSP_BUILD_ANDROID_OS=y
+          export KBUILD_BUILD_USER='ReSukiSU-SUSFS-CI'
+          export KBUILD_BUILD_HOST='github-actions'
+          sed -i '/yamltree.o/d' scripts/dtc/Makefile || true
+          sed -i '/dt_to_yaml/d' scripts/dtc/dtc.c || true
+          make O=out -j"$(nproc)" BSP_BUILD_DT_OVERLAY=y CC=clang LD=ld.lld ARCH=arm64 \
+            CLANG_TRIPLE="$CLANG_TRIPLE" CROSS_COMPILE="$CROSS_COMPILE" \
+            CROSS_COMPILE_ARM32="$CROSS_COMPILE_ARM32" Image
+          test -s out/arch/arm64/boot/Image
+          ls -lh out/arch/arm64/boot/Image
+
+      - name: Repack repository stock boot for smoke testing
+        shell: bash
+        working-directory: kernel
+        run: |
+          set -euxo pipefail
+          rm -rf ci-boot
+          mkdir ci-boot
+          tar -xJf Publish/a3core-A032FXXS6CXE1.tar.xz -C ci-boot
+          cp Publish/magiskboot ci-boot/magiskboot
+          chmod +x ci-boot/magiskboot
+          cd ci-boot
+          ./magiskboot unpack stock-boot.img
+          rm -f kernel
+          cp ../out/arch/arm64/boot/Image kernel
+          ./magiskboot repack stock-boot.img boot-resukisu-susfs.img
+          test -s boot-resukisu-susfs.img
+          ls -lh boot-resukisu-susfs.img
+
+      - name: Write build metadata
+        shell: bash
+        working-directory: kernel
+        run: |
+          {
+            echo "source_branch=$SOURCE_BRANCH"
+            echo "device_commit=$(git rev-parse HEAD)"
+            echo "resukisu_commit=$(cat "$RUNNER_TEMP/resukisu.sha")"
+            echo "susfs_commit=$(cat "$RUNNER_TEMP/susfs.sha")"
+          } | tee build-metadata.txt
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: A032F-ReSukiSU-SUSFS
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            kernel/out/arch/arm64/boot/Image
+            kernel/out/.config
+            kernel/ci-boot/boot-resukisu-susfs.img
+            kernel/Publish/magiskboot
+            kernel/build-metadata.txt
