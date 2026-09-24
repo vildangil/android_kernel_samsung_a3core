@@ -103,6 +103,21 @@ jobs:
             exit "$PATCH_RC"
           fi
 
+      - name: Upload SUSFS patch diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: susfs-patch-diagnostics
+          if-no-files-found: warn
+          retention-days: 3
+          path: |
+            kernel/**/*.rej
+            kernel/susfs4ksu/kernel_patches/50_add_susfs_in_kernel-4.14.patch
+            kernel/fs/namei.c
+            kernel/fs/namespace.c
+            kernel/fs/notify/fdinfo.c
+            kernel/fs/proc/task_mmu.c
+            kernel/fs/readdir.c
       - name: Install build dependencies
         run: |
           sudo apt-get update
