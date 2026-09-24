@@ -349,6 +349,11 @@ jobs:
           export DTC_OVERLAY_TEST_EXT="${GITHUB_WORKSPACE}/tools/mkdtimg/ufdt_apply_overlay"
           export DTC_OVERLAY_VTS_EXT="${GITHUB_WORKSPACE}/tools/mkdtimg/ufdt_verify_overlay_host"
 
+          # This vendor DTC snapshot references YAML output without linking
+          # libyaml. Samsung's kernel build does not need the YAML emitter.
+          sed -i '/yamltree.o/d' scripts/dtc/Makefile
+          sed -i '/dt_to_yaml/d' scripts/dtc/dtc.c
+
           make -C "$KERNEL_ROOT" O="$OUT" -j"$(nproc)" \
             BSP_BUILD_DT_OVERLAY=y ARCH="$ARCH" CC="$CC" LD="$LD" \
             CROSS_COMPILE="$CROSS_COMPILE" CLANG_TRIPLE="$CLANG_TRIPLE" \
