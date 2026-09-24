@@ -95,12 +95,149 @@ jobs:
           PATCH_RC=$?
           set -e
           if [ "$PATCH_RC" -ne 0 ]; then
-            echo '=== SUSFS rejected hunks ==='
-            while IFS= read -r rej; do
-              echo "===== $rej ====="
-              cat "$rej"
-            done < <(find . -name '*.rej' -type f -print | sort)
-            exit "$PATCH_RC"
+            echo 'SUSFS needs the known Samsung 4.14 compatibility adjustments'
+            python3 - <<'PY'
+          from pathlib import Path
+
+          root = Path('.')
+          known = {
+              'fs/namei.c.rej',
+              'fs/namespace.c.rej',
+              'fs/notify/fdinfo.c.rej',
+              'fs/proc/task_mmu.c.rej',
+              'fs/readdir.c.rej',
+          }
+          actual = {str(p) for p in root.rglob('*.rej')}
+          unknown = actual - known
+          if unknown:
+              raise SystemExit(f'Unknown SUSFS rejects: {sorted(unknown)}')
+
+          def replace_once(path, old, new):
+              p = root / path
+              s = p.read_text()
+              if new in s:
+                  return
+              if old not in s:
+                  raise SystemExit(f'Anchor not found in {path}: {old!r}')
+              p.write_text(s.replace(old, new, 1))
+
+          # Samsung added avc_backtrace.h after uaccess.h.
+          replace_once(
+              'fs/namei.c',
+              '#include <linux/avc_backtrace.h>\n',
+              '#include <linux/avc_backtrace.h>\n'
+              '#if defined(CONFIG_KSU_SUSFS_SUS_PATH) || defined(CONFIG_KSU_SUSFS_OPEN_REDIRECT)\n'
+              '#include <linux/susfs_def.h>\n'
+              '#endif\n',
+          )
+
+          # Samsung added fslog.h in the include area; put SUSFS declarations after it.
+          replace_once(
+              'fs/namespace.c',
+              '#include <linux/fslog.h>\n',
+              '#include <linux/fslog.h>\n'
+              '#if defined(CONFIG_KSU_SUSFS_SUS_MOUNT) || defined(CONFIG_KSU_SUSFS_TRY_UMOUNT)\n'
+              '#include <linux/susfs_def.h>\n'
+              '#endif\n',
+          )
+          ns_block = '''#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+          extern bool susfs_is_current_ksu_domain(void);
+          extern bool susfs_is_current_zygote_domain(void);
+
+          static DEFINE_IDA(susfs_mnt_id_ida);
+          static DEFINE_IDA(susfs_mnt_group_ida);
+          static int susfs_mnt_id_start = DEFAULT_SUS_MNT_ID;
+          static int susfs_mnt_group_start = DEFAULT_SUS_MNT_GROUP_ID;
+
+          #define CL_ZYGOTE_COPY_MNT_NS BIT(24) /* used by copy_mnt_ns() */
+          #define CL_COPY_MNT_NS BIT(25) /* used by copy_mnt_ns() */
+          #endif
+
+          #ifdef CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT
+          extern void susfs_auto_add_sus_ksu_default_mount(const char __user *to_pathname);
+          bool susfs_is_auto_add_sus_ksu_default_mount_enabled = true;
+          #endif
+          #ifdef CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT
+          extern int susfs_auto_add_sus_bind_mount(const char *pathname, struct path *path_target);
+          bool susfs_is_auto_add_sus_bind_mount_enabled = true;
+          #endif
+          #ifdef CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT
+          extern void susfs_auto_add_try_umount_for_bind_mount(struct path *path);
+          bool susfs_is_auto_add_try_umount_for_bind_mount_enabled = true;
+          #endif
+
+          '''
+          replace_once(
+              'fs/namespace.c',
+              '/* Maximum number of mounts in a mount namespace */\n',
+              ns_block + '/* Maximum number of mounts in a mount namespace */\n',
+          )
+
+          # Samsung's task_mmu include ordering differs from the generic 4.14 tree.
+          replace_once(
+              'fs/proc/task_mmu.c',
+              '#include <linux/ctype.h>\n',
+              '#include <linux/ctype.h>\n'
+              '#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT\n'
+              '#include <linux/susfs_def.h>\n'
+              '#endif\n',
+          )
+
+          # Samsung's compat_fillonedir has an extra ino overflow conversion.
+          readdir_anchor = '''\tif (buf->result)
+          \t\treturn -EINVAL;
+          '''
+          readdir_insert = readdir_anchor + '''#ifdef CONFIG_KSU_SUSFS_SUS_PATH
+          \tif (likely(current->susfs_task_state & TASK_STRUCT_NON_ROOT_USER_APP_PROC) &&
+          \t\t\tsusfs_sus_ino_for_filldir64(ino)) {
+          \t\treturn 0;
+          \t}
+          #endif
+          '''
+          replace_once('fs/readdir.c', readdir_anchor, readdir_insert)
+
+          # Samsung's inotify fdinfo reports ignored_mask, unlike the generic patch context.
+          fd_anchor = '''\t\tu32 mask = mark->mask & IN_ALL_EVENTS;
+          '''
+          fd_insert = fd_anchor + '''#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+          \t\tif (likely(current->susfs_task_state & TASK_STRUCT_NON_ROOT_USER_APP_PROC) &&
+          \t\t\t\tunlikely(inode->i_state & INODE_STATE_SUS_KSTAT)) {
+          \t\t\tstruct path path;
+          \t\t\tchar *pathname = kmalloc(PAGE_SIZE, GFP_KERNEL);
+          \t\t\tchar *dpath;
+          \t\t\tif (!pathname)
+          \t\t\t\tgoto out_seq_printf;
+          \t\t\tdpath = d_path(&file->f_path, pathname, PAGE_SIZE);
+          \t\t\tif (IS_ERR(dpath))
+          \t\t\t\tgoto out_free_pathname;
+          \t\t\tif (kern_path(dpath, 0, &path))
+          \t\t\t\tgoto out_free_pathname;
+          \t\t\tseq_printf(m, "inotify wd:%x ino:%lx sdev:%x mask:%x ignored_mask:%x ",
+          \t\t\t\tinode_mark->wd, path.dentry->d_inode->i_ino,
+          \t\t\t\tpath.dentry->d_inode->i_sb->s_dev, mask, mark->ignored_mask);
+          \t\t\tshow_mark_fhandle(m, path.dentry->d_inode);
+          \t\t\tseq_putc(m, '\\n');
+          \t\t\tiput(inode);
+          \t\t\tpath_put(&path);
+          \t\t\tkfree(pathname);
+          \t\t\treturn;
+          out_free_pathname:
+          \t\t\tkfree(pathname);
+          \t\t}
+          out_seq_printf:
+          #endif
+          '''
+          replace_once('fs/notify/fdinfo.c', fd_anchor, fd_insert)
+
+          for rej in actual:
+              (root / rej).unlink(missing_ok=True)
+          print('Applied Samsung A03 Core SUSFS 4.14 compatibility adjustments')
+          PY
+            if find . -name '*.rej' -type f -print -quit | grep -q .; then
+              echo 'Unexpected SUSFS reject remains:'
+              find . -name '*.rej' -type f -print -exec cat {} \;
+              exit 1
+            fi
           fi
 
       - name: Upload SUSFS patch diagnostics
