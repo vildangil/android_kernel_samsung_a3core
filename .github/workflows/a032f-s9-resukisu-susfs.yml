@@ -44,27 +44,36 @@ jobs:
             bc bison build-essential ca-certificates ccache curl flex git \
             libelf-dev libssl-dev make patch python3 rsync wget xz-utils zip
 
+      - name: Cache Android toolchains
+        uses: actions/cache@v4
+        with:
+          path: toolchains
+          key: a032f-r383902-gcc49-ee0dbcb-v1
+
       - name: Install Samsung-matching Android toolchains
         shell: bash
         run: |
           set -euxo pipefail
           mkdir -p toolchains/clang-r383902 toolchains/gcc49
 
-          # Stock A032FXXS9CZA1 reports Android clang 11.0.1, build 6443078
-          # (clang-r383902), so use that exact AOSP prebuilt generation.
-          wget -q \
-            "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/0e9e7035bf8ad42437c6156e5950eab13655b26c/clang-r383902.tar.gz" \
-            -O clang.tar.gz
-          tar -xf clang.tar.gz -C toolchains/clang-r383902
-          rm clang.tar.gz
+          if [ ! -x toolchains/clang-r383902/bin/clang ]; then
+            # Stock A032FXXS9CZA1 reports Android clang 11.0.1, build 6443078
+            # (clang-r383902), so use that exact AOSP prebuilt generation.
+            wget -q \
+              "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/0e9e7035bf8ad42437c6156e5950eab13655b26c/clang-r383902.tar.gz" \
+              -O clang.tar.gz
+            tar -xf clang.tar.gz -C toolchains/clang-r383902
+            rm clang.tar.gz
+          fi
 
-          # Samsung's source build script uses aarch64-linux-android-4.9 for
-          # CROSS_COMPILE. This AOSP snapshot still contains the full toolchain.
-          wget -q \
-            "https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/+archive/ee0dbcb97f44a609dbfb354e63e05e305031365b.tar.gz" \
-            -O gcc49.tar.gz
-          tar -xf gcc49.tar.gz -C toolchains/gcc49
-          rm gcc49.tar.gz
+          if [ ! -x toolchains/gcc49/bin/aarch64-linux-android-gcc ]; then
+            # Samsung's source build script uses aarch64-linux-android-4.9.
+            wget -q \
+              "https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/+archive/ee0dbcb97f44a609dbfb354e63e05e305031365b.tar.gz" \
+              -O gcc49.tar.gz
+            tar -xf gcc49.tar.gz -C toolchains/gcc49
+            rm gcc49.tar.gz
+          fi
 
           echo "${GITHUB_WORKSPACE}/toolchains/clang-r383902/bin" >> "$GITHUB_PATH"
           echo "${GITHUB_WORKSPACE}/toolchains/gcc49/bin" >> "$GITHUB_PATH"
@@ -252,6 +261,9 @@ jobs:
           git -C KernelSU reset --hard HEAD
           git -C KernelSU clean -fd
 
+          # The upstream 4.14 patch currently carries a few trailing spaces.
+          # Normalize only whitespace before enforcing a clean diff.
+          sed -i 's/[[:space:]]\+$//' fs/namespace.c fs/overlayfs/readdir.c
           git diff --check
           test -f fs/susfs.c
           test -f include/linux/susfs.h
