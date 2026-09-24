@@ -61,7 +61,7 @@ jobs:
           # Samsung's source build script uses aarch64-linux-android-4.9 for
           # CROSS_COMPILE. This AOSP snapshot still contains the full toolchain.
           wget -q \
-            "https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/+archive/0a0604336d4d1067aa1aaef8d3779b31fcee841d.tar.gz" \
+            "https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/+archive/ee0dbcb97f44a609dbfb354e63e05e305031365b.tar.gz" \
             -O gcc49.tar.gz
           tar -xf gcc49.tar.gz -C toolchains/gcc49
           rm gcc49.tar.gz
