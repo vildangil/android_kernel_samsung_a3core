@@ -94,16 +94,167 @@ jobs:
           cp -a susfs4ksu/kernel_patches/fs/. fs/
           cp -a susfs4ksu/kernel_patches/include/linux/. include/linux/
 
-          if ! patch --batch --forward -p1 < susfs4ksu/kernel_patches/50_add_susfs_in_kernel-4.14.patch; then
-            echo "::error::SUSFS 4.14 kernel patch did not apply cleanly."
-            find . -name '*.rej' -print -exec sh -c 'echo "===== $1 ====="; cat "$1"' _ {} \;
-            exit 1
+          set +e
+          patch --batch --forward -p1 < susfs4ksu/kernel_patches/50_add_susfs_in_kernel-4.14.patch
+          PATCH_RC=$?
+          set -e
+
+          if [ "$PATCH_RC" -ne 0 ]; then
+            # Samsung's A032F tree has a few vendor-only lines around five
+            # upstream 4.14 hunks. All functional hunks apply; adapt only the
+            # rejected context-sensitive pieces and fail on any new reject.
+            python3 - <<'PY'
+          from pathlib import Path
+
+          expected = {
+              "fs/namei.c.rej",
+              "fs/namespace.c.rej",
+              "fs/notify/fdinfo.c.rej",
+              "fs/proc/task_mmu.c.rej",
+              "fs/readdir.c.rej",
+          }
+          found = {str(p) for p in Path(".").rglob("*.rej")}
+          if found != expected:
+              raise SystemExit(f"Unexpected SUSFS rejects: {sorted(found)} (expected {sorted(expected)})")
+
+          def put_after(path, needle, addition):
+              p = Path(path)
+              t = p.read_text()
+              if addition.strip() in t:
+                  return
+              if t.count(needle) != 1:
+                  raise SystemExit(f"{path}: marker count for {needle!r} is {t.count(needle)}")
+              p.write_text(t.replace(needle, needle + addition, 1))
+
+          put_after(
+              "fs/namei.c",
+              "#include <linux/avc_backtrace.h>\n",
+              """#if defined(CONFIG_KSU_SUSFS_SUS_PATH) || defined(CONFIG_KSU_SUSFS_OPEN_REDIRECT)
+          #include <linux/susfs_def.h>
+          #endif
+          """,
+          )
+
+          put_after(
+              "fs/proc/task_mmu.c",
+              "#include <linux/ctype.h>\n",
+              """#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT
+          #include <linux/susfs_def.h>
+          #endif
+          """,
+          )
+
+          put_after(
+              "fs/namespace.c",
+              "#include <linux/fslog.h>\n",
+              """#if defined(CONFIG_KSU_SUSFS_SUS_MOUNT) || defined(CONFIG_KSU_SUSFS_TRY_UMOUNT)
+          #include <linux/susfs_def.h>
+          #endif
+
+          #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+          extern bool susfs_is_current_ksu_domain(void);
+          extern bool susfs_is_current_zygote_domain(void);
+
+          static DEFINE_IDA(susfs_mnt_id_ida);
+          static DEFINE_IDA(susfs_mnt_group_ida);
+          static int susfs_mnt_id_start = DEFAULT_SUS_MNT_ID;
+          static int susfs_mnt_group_start = DEFAULT_SUS_MNT_GROUP_ID;
+
+          #define CL_ZYGOTE_COPY_MNT_NS BIT(24) /* used by copy_mnt_ns() */
+          #define CL_COPY_MNT_NS BIT(25) /* used by copy_mnt_ns() */
+          #endif
+
+          #ifdef CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT
+          extern void susfs_auto_add_sus_ksu_default_mount(const char __user *to_pathname);
+          bool susfs_is_auto_add_sus_ksu_default_mount_enabled = true;
+          #endif
+          #ifdef CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT
+          extern int susfs_auto_add_sus_bind_mount(const char *pathname, struct path *path_target);
+          bool susfs_is_auto_add_sus_bind_mount_enabled = true;
+          #endif
+          #ifdef CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT
+          extern void susfs_auto_add_try_umount_for_bind_mount(struct path *path);
+          bool susfs_is_auto_add_try_umount_for_bind_mount_enabled = true;
+          #endif
+
+          """,
+          )
+
+          p = Path("fs/readdir.c")
+          t = p.read_text()
+          start = t.index("static int compat_fillonedir(")
+          end = t.index("\n}\n\nCOMPAT_SYSCALL_DEFINE3(old_readdir", start)
+          seg = t[start:end]
+          hook = """#ifdef CONFIG_KSU_SUSFS_SUS_PATH
+          \tif (likely(current->susfs_task_state & TASK_STRUCT_NON_ROOT_USER_APP_PROC) &&
+          \t\t\tsusfs_sus_ino_for_filldir64(ino)) {
+          \t\treturn 0;
+          \t}
+          #endif
+          """
+          if "susfs_sus_ino_for_filldir64(ino)" not in seg:
+              needle = "\tif (buf->result)\n\t\treturn -EINVAL;\n"
+              if needle not in seg:
+                  raise SystemExit("fs/readdir.c: compat_fillonedir insertion point not found")
+              seg = seg.replace(needle, needle + hook, 1)
+              p.write_text(t[:start] + seg + t[end:])
+
+          p = Path("fs/notify/fdinfo.c")
+          t = p.read_text()
+          start = t.index("static void inotify_fdinfo(")
+          end = t.index("\nvoid inotify_show_fdinfo", start)
+          seg = t[start:end]
+          if "out_seq_printf:" not in seg:
+              needle = "\t\tu32 mask = mark->mask & IN_ALL_EVENTS;\n"
+              if needle not in seg:
+                  raise SystemExit("fs/notify/fdinfo.c: vendor mask insertion point not found")
+              hook = """#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+          \t\tif (likely(current->susfs_task_state & TASK_STRUCT_NON_ROOT_USER_APP_PROC) &&
+          \t\t\t\tunlikely(inode->i_state & INODE_STATE_SUS_KSTAT)) {
+          \t\t\tstruct path path;
+          \t\t\tchar *pathname = kmalloc(PAGE_SIZE, GFP_KERNEL);
+          \t\t\tchar *dpath;
+          \t\t\tif (!pathname)
+          \t\t\t\tgoto out_seq_printf;
+          \t\t\tdpath = d_path(&file->f_path, pathname, PAGE_SIZE);
+          \t\t\tif (!dpath)
+          \t\t\t\tgoto out_free_pathname;
+          \t\t\tif (kern_path(dpath, 0, &path))
+          \t\t\t\tgoto out_free_pathname;
+          \t\t\tseq_printf(m, "inotify wd:%x ino:%lx sdev:%x mask:%x ignored_mask:0 ",
+          \t\t\t\tinode_mark->wd, path.dentry->d_inode->i_ino,
+          \t\t\t\tpath.dentry->d_inode->i_sb->s_dev, inotify_mark_user_mask(mark));
+          \t\t\tshow_mark_fhandle(m, path.dentry->d_inode);
+          \t\t\tseq_putc(m, '\\n');
+          \t\t\tiput(inode);
+          \t\t\tpath_put(&path);
+          \t\t\tkfree(pathname);
+          \t\t\treturn;
+          out_free_pathname:
+          \t\t\tkfree(pathname);
+          \t\t}
+          out_seq_printf:
+          #endif
+          """
+              seg = seg.replace(needle, needle + hook, 1)
+              p.write_text(t[:start] + seg + t[end:])
+
+          for rel in expected:
+              Path(rel).unlink()
+
+          if list(Path(".").rglob("*.rej")):
+              raise SystemExit("SUSFS reject files remain after A032F adaptation")
+          PY
           fi
 
           # The kernel-side patch must not overwrite ReSukiSU's native
           # manager-side SUSFS implementation.
           git -C KernelSU reset --hard HEAD
           git -C KernelSU clean -fd
+
+          git diff --check
+          test -f fs/susfs.c
+          test -f include/linux/susfs.h
 
           echo "SUSFS_SHA=$(git -C susfs4ksu rev-parse HEAD)" >> "$GITHUB_ENV"
           SUSFS_VERSION="$(sed -n 's/^#define SUSFS_VERSION[[:space:]]*"\([^"]*\)".*/\1/p' include/linux/susfs.h | head -n1)"
