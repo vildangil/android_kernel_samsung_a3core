@@ -76,17 +76,6 @@ jobs:
             libncurses-dev libssl-dev lz4 make patch python3 rsync unzip \
             xz-utils zip gcc-aarch64-linux-gnu gcc-arm-linux-gnueabihf
 
-      - name: Install Android Clang r383902b
-        shell: bash
-        run: |
-          set -euxo pipefail
-          mkdir -p "$GITHUB_WORKSPACE/toolchains/clang-r383902b"
-          curl -L --fail --retry 3 \
-            'https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/0e9e7035bf8ad42437c6156e5950eab13655b26c/clang-r383902b.tar.gz' \
-            -o "$RUNNER_TEMP/clang.tar.gz"
-          tar -xzf "$RUNNER_TEMP/clang.tar.gz" -C "$GITHUB_WORKSPACE/toolchains/clang-r383902b"
-          echo "$GITHUB_WORKSPACE/toolchains/clang-r383902b/bin" >> "$GITHUB_PATH"
-
       - name: Integrate latest ReSukiSU
         shell: bash
         working-directory: kernel
@@ -109,7 +98,29 @@ jobs:
           git -C susfs4ksu rev-parse HEAD | tee "$RUNNER_TEMP/susfs.sha"
           cp -a susfs4ksu/kernel_patches/fs/. fs/
           cp -a susfs4ksu/kernel_patches/include/linux/. include/linux/
+          set +e
           patch -p1 --forward < susfs4ksu/kernel_patches/50_add_susfs_in_kernel-4.14.patch
+          PATCH_RC=$?
+          set -e
+          if [ "$PATCH_RC" -ne 0 ]; then
+            echo '=== SUSFS rejected hunks ==='
+            while IFS= read -r rej; do
+              echo "===== $rej ====="
+              cat "$rej"
+            done < <(find . -name '*.rej' -type f -print | sort)
+            exit "$PATCH_RC"
+          fi
+
+      - name: Install Android Clang r383902b
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/toolchains/clang-r383902b"
+          curl -L --fail --retry 3 \
+            'https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/0e9e7035bf8ad42437c6156e5950eab13655b26c/clang-r383902b.tar.gz' \
+            -o "$RUNNER_TEMP/clang.tar.gz"
+          tar -xzf "$RUNNER_TEMP/clang.tar.gz" -C "$GITHUB_WORKSPACE/toolchains/clang-r383902b"
+          echo "$GITHUB_WORKSPACE/toolchains/clang-r383902b/bin" >> "$GITHUB_PATH"
 
       - name: Configure kernel
         shell: bash
