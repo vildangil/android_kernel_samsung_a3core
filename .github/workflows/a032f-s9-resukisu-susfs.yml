@@ -1,0 +1,223 @@
+name: Build A032F S9 ReSukiSU + SUSFS
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - chatgpt/a032f-s9-resukisu-susfs
+    paths:
+      - .github/workflows/a032f-s9-resukisu-susfs.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: a032f-s9-resukisu-susfs-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    env:
+      ARCH: arm64
+      KERNEL_ROOT: ${{ github.workspace }}
+      OUT: ${{ github.workspace }}/out
+      STOCK_KERNEL_RELEASE: 4.14.199-27418755-abA032FXXS9CZA1
+      LOCALVERSION: -27418755-abA032FXXS9CZA1
+      BSP_BUILD_FAMILY: sharkl3
+      BSP_BUILD_ANDROID_OS: y
+      KBUILD_BUILD_USER: dpi
+      KBUILD_BUILD_HOST: 21DN4404
+      KBUILD_BUILD_VERSION: "2"
+      KBUILD_BUILD_TIMESTAMP: "Fri Jan 9 17:27:02 KST 2026"
+
+    steps:
+      - name: Checkout stock 4.14.199 source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc bison build-essential ca-certificates ccache curl flex git \
+            libelf-dev libssl-dev make patch python3 rsync wget xz-utils zip
+
+      - name: Install Samsung-matching Android toolchains
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p toolchains/clang-r383902 toolchains/gcc49
+
+          # Stock A032FXXS9CZA1 reports Android clang 11.0.1, build 6443078
+          # (clang-r383902), so use that exact AOSP prebuilt generation.
+          wget -q \
+            "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/0e9e7035bf8ad42437c6156e5950eab13655b26c/clang-r383902.tar.gz" \
+            -O clang.tar.gz
+          tar -xf clang.tar.gz -C toolchains/clang-r383902
+          rm clang.tar.gz
+
+          # Samsung's source build script uses aarch64-linux-android-4.9 for
+          # CROSS_COMPILE. This AOSP snapshot still contains the full toolchain.
+          wget -q \
+            "https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/+archive/0a0604336d4d1067aa1aaef8d3779b31fcee841d.tar.gz" \
+            -O gcc49.tar.gz
+          tar -xf gcc49.tar.gz -C toolchains/gcc49
+          rm gcc49.tar.gz
+
+          echo "${GITHUB_WORKSPACE}/toolchains/clang-r383902/bin" >> "$GITHUB_PATH"
+          echo "${GITHUB_WORKSPACE}/toolchains/gcc49/bin" >> "$GITHUB_PATH"
+
+          "${GITHUB_WORKSPACE}/toolchains/clang-r383902/bin/clang" --version | head -n 1
+          test -x "${GITHUB_WORKSPACE}/toolchains/gcc49/bin/aarch64-linux-android-gcc"
+
+      - name: Integrate latest ReSukiSU
+        shell: bash
+        run: |
+          set -euxo pipefail
+          curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash
+          test -f drivers/kernelsu/Kconfig
+          echo "RESUKISU_SHA=$(git -C KernelSU rev-parse HEAD)" >> "$GITHUB_ENV"
+          git -C KernelSU log -1 --oneline
+
+      - name: Integrate latest SUSFS for kernel 4.14
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          # ReSukiSU already implements the manager/KernelSU side of SUSFS.
+          # Only apply simonpunk's kernel-side 4.14 patch and source files.
+          git clone --depth 1 --branch kernel-4.14 \
+            https://gitlab.com/simonpunk/susfs4ksu.git susfs4ksu
+
+          cp -a susfs4ksu/kernel_patches/fs/. fs/
+          cp -a susfs4ksu/kernel_patches/include/linux/. include/linux/
+
+          if ! patch --batch --forward -p1 < susfs4ksu/kernel_patches/50_add_susfs_in_kernel-4.14.patch; then
+            echo "::error::SUSFS 4.14 kernel patch did not apply cleanly."
+            find . -name '*.rej' -print -exec sh -c 'echo "===== $1 ====="; cat "$1"' _ {} \;
+            exit 1
+          fi
+
+          # The kernel-side patch must not overwrite ReSukiSU's native
+          # manager-side SUSFS implementation.
+          git -C KernelSU reset --hard HEAD
+          git -C KernelSU clean -fd
+
+          echo "SUSFS_SHA=$(git -C susfs4ksu rev-parse HEAD)" >> "$GITHUB_ENV"
+          SUSFS_VERSION="$(sed -n 's/^#define SUSFS_VERSION[[:space:]]*"\([^"]*\)".*/\1/p' include/linux/susfs.h | head -n1)"
+          echo "SUSFS_VERSION=$SUSFS_VERSION" >> "$GITHUB_ENV"
+          echo "SUSFS version: $SUSFS_VERSION"
+
+      - name: Configure from Samsung A032F stock defconfig
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          export PATH="${GITHUB_WORKSPACE}/toolchains/clang-r383902/bin:${GITHUB_WORKSPACE}/toolchains/gcc49/bin:$PATH"
+          export CROSS_COMPILE="${GITHUB_WORKSPACE}/toolchains/gcc49/bin/aarch64-linux-android-"
+          export CLANG_TRIPLE=aarch64-linux-gnu-
+          export CC=clang
+          export LD=ld.lld
+          export DTC_OVERLAY_TEST_EXT="${GITHUB_WORKSPACE}/tools/mkdtimg/ufdt_apply_overlay"
+          export DTC_OVERLAY_VTS_EXT="${GITHUB_WORKSPACE}/tools/mkdtimg/ufdt_verify_overlay_host"
+
+          make -C "$KERNEL_ROOT" O="$OUT" \
+            BSP_BUILD_DT_OVERLAY=y ARCH="$ARCH" CC="$CC" LD="$LD" \
+            CROSS_COMPILE="$CROSS_COMPILE" CLANG_TRIPLE="$CLANG_TRIPLE" \
+            a3core_eur_open_defconfig
+
+          chmod +x scripts/config
+          scripts/config --file "$OUT/.config" -e KSU
+          scripts/config --file "$OUT/.config" -e KSU_SUSFS
+          scripts/config --file "$OUT/.config" -d KSU_TRACEPOINT_HOOK || true
+          scripts/config --file "$OUT/.config" -d KSU_MANUAL_HOOK || true
+          scripts/config --file "$OUT/.config" -d KSU_DEBUG || true
+          scripts/config --file "$OUT/.config" --set-str LOCALVERSION ""
+
+          make -C "$KERNEL_ROOT" O="$OUT" \
+            BSP_BUILD_DT_OVERLAY=y ARCH="$ARCH" CC="$CC" LD="$LD" \
+            CROSS_COMPILE="$CROSS_COMPILE" CLANG_TRIPLE="$CLANG_TRIPLE" \
+            LOCALVERSION="$LOCALVERSION" olddefconfig
+
+          grep -q '^CONFIG_KSU=y$' "$OUT/.config"
+          grep -q '^CONFIG_KSU_SUSFS=y$' "$OUT/.config"
+          grep -q '^CONFIG_MODULES=y$' "$OUT/.config"
+          grep -q '^CONFIG_MODVERSIONS=y$' "$OUT/.config"
+          grep -q '^CONFIG_KPROBES=y$' "$OUT/.config"
+
+          echo "===== ReSukiSU / SUSFS config ====="
+          grep -E '^CONFIG_KSU|^# CONFIG_KSU' "$OUT/.config" || true
+
+      - name: Verify Wi-Fi/module-compatible kernel release
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          export PATH="${GITHUB_WORKSPACE}/toolchains/clang-r383902/bin:${GITHUB_WORKSPACE}/toolchains/gcc49/bin:$PATH"
+          export CROSS_COMPILE="${GITHUB_WORKSPACE}/toolchains/gcc49/bin/aarch64-linux-android-"
+          export CLANG_TRIPLE=aarch64-linux-gnu-
+          export CC=clang
+          export LD=ld.lld
+
+          KERNEL_RELEASE="$(make -s -C "$KERNEL_ROOT" O="$OUT" \
+            ARCH="$ARCH" CC="$CC" LD="$LD" CROSS_COMPILE="$CROSS_COMPILE" \
+            CLANG_TRIPLE="$CLANG_TRIPLE" LOCALVERSION="$LOCALVERSION" kernelrelease)"
+
+          echo "KERNEL_RELEASE=$KERNEL_RELEASE" >> "$GITHUB_ENV"
+          echo "Kernel release: $KERNEL_RELEASE"
+
+          if [ "$KERNEL_RELEASE" != "$STOCK_KERNEL_RELEASE" ]; then
+            echo "::error::Kernel release differs from the stock S9 boot image; refusing to build a Wi-Fi-risky image."
+            exit 1
+          fi
+
+      - name: Build Image
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          export PATH="${GITHUB_WORKSPACE}/toolchains/clang-r383902/bin:${GITHUB_WORKSPACE}/toolchains/gcc49/bin:$PATH"
+          export CROSS_COMPILE="${GITHUB_WORKSPACE}/toolchains/gcc49/bin/aarch64-linux-android-"
+          export CLANG_TRIPLE=aarch64-linux-gnu-
+          export CC=clang
+          export LD=ld.lld
+          export DTC_OVERLAY_TEST_EXT="${GITHUB_WORKSPACE}/tools/mkdtimg/ufdt_apply_overlay"
+          export DTC_OVERLAY_VTS_EXT="${GITHUB_WORKSPACE}/tools/mkdtimg/ufdt_verify_overlay_host"
+
+          make -C "$KERNEL_ROOT" O="$OUT" -j"$(nproc)" \
+            BSP_BUILD_DT_OVERLAY=y ARCH="$ARCH" CC="$CC" LD="$LD" \
+            CROSS_COMPILE="$CROSS_COMPILE" CLANG_TRIPLE="$CLANG_TRIPLE" \
+            LOCALVERSION="$LOCALVERSION" Image
+
+          test -s "$OUT/arch/arm64/boot/Image"
+          strings "$OUT/arch/arm64/boot/Image" | grep -m1 '^Linux version 4\.14\.199-27418755-abA032FXXS9CZA1 ' || {
+            echo "::error::Built Image does not contain the expected stock-compatible Linux release string."
+            exit 1
+          }
+
+      - name: Write build metadata
+        shell: bash
+        run: |
+          {
+            echo "source_branch=stock"
+            echo "source_commit=${GITHUB_SHA}"
+            echo "kernel_release=${KERNEL_RELEASE}"
+            echo "resukisu_sha=${RESUKISU_SHA}"
+            echo "susfs_sha=${SUSFS_SHA}"
+            echo "susfs_version=${SUSFS_VERSION}"
+            "${GITHUB_WORKSPACE}/toolchains/clang-r383902/bin/clang" --version | head -n 1 | sed 's/^/clang=/'
+          } | tee "$OUT/build-info.txt"
+
+      - name: Upload kernel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: A032F-S9-ReSukiSU-SUSFS
+          path: |
+            ${{ github.workspace }}/out/arch/arm64/boot/Image
+            ${{ github.workspace }}/out/.config
+            ${{ github.workspace }}/out/Module.symvers
+            ${{ github.workspace }}/out/build-info.txt
+          if-no-files-found: error
+          retention-days: 14
