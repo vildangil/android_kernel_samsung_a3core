@@ -238,7 +238,7 @@ jobs:
           \t\t\t\tgoto out_free_pathname;
           \t\t\tseq_printf(m, "inotify wd:%x ino:%lx sdev:%x mask:%x ignored_mask:0 ",
           \t\t\t\tinode_mark->wd, path.dentry->d_inode->i_ino,
-          \t\t\t\tpath.dentry->d_inode->i_sb->s_dev, inotify_mark_user_mask(mark));
+          \t\t\t\tpath.dentry->d_inode->i_sb->s_dev, mask);
           \t\t\tshow_mark_fhandle(m, path.dentry->d_inode);
           \t\t\tseq_putc(m, '\\n');
           \t\t\tiput(inode);
@@ -254,6 +254,24 @@ jobs:
               seg = seg.replace(needle, needle + hook, 1)
               p.write_text(t[:start] + seg + t[end:])
 
+          # Samsung's 4.14 fanotify callback still has the stock two-argument
+          # signature, while the SUSFS fdinfo wrapper passes struct file *.
+          # Keep both signatures valid so the source remains buildable with
+          # and without CONFIG_KSU_SUSFS_SUS_MOUNT.
+          p = Path("fs/notify/fdinfo.c")
+          t = p.read_text()
+          old = "static void fanotify_fdinfo(struct seq_file *m, struct fsnotify_mark *mark)\\n"
+          if old not in t:
+              raise SystemExit("fs/notify/fdinfo.c: fanotify_fdinfo signature not found")
+          new = """#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+          static void fanotify_fdinfo(struct seq_file *m, struct fsnotify_mark *mark, struct file *file)
+          #else
+          static void fanotify_fdinfo(struct seq_file *m, struct fsnotify_mark *mark)
+          #endif
+          """
+          t = t.replace(old, new, 1)
+          p.write_text(t)
+
           for rel in expected:
               Path(rel).unlink()
 
@@ -266,6 +284,133 @@ jobs:
           # manager-side SUSFS implementation.
           git -C KernelSU reset --hard HEAD
           git -C KernelSU clean -fd
+
+          # ReSukiSU main speaks the newer SUSFS reboot ABI, while the
+          # maintained kernel-4.14 branch is v1.5.5. Bridge only commands
+          # whose wire layouts can be translated safely. Newer v2-only
+          # commands deliberately remain unsupported instead of corrupting
+          # legacy v1.5.5 structures in kernel memory.
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path("KernelSU/kernel/supercall/dispatch.c")
+          t = p.read_text()
+          old_include = "#ifdef CONFIG_KSU_SUSFS\\n#include <linux/susfs_def.h>\\n#endif\\n"
+          new_include = "#ifdef CONFIG_KSU_SUSFS\\n#include <linux/susfs_def.h>\\n#include <linux/susfs.h>\\n#endif\\n"
+          if old_include not in t:
+              raise SystemExit("ReSukiSU dispatch SUSFS include block not found")
+          t = t.replace(old_include, new_include, 1)
+
+          start = t.index("#ifdef CONFIG_KSU_SUSFS\\nint ksu_handle_susfs_cmd(")
+          marker = "\\n#endif\\n\\n#ifdef CONFIG_KSU_TOOLKIT_SUPPORT"
+          end = t.index(marker, start) + len("\\n#endif")
+
+          compat = r"""
+          #ifdef CONFIG_KSU_SUSFS
+          struct resukisu_susfs_log_legacy {
+          \tbool enabled;
+          \tint err;
+          };
+
+          struct resukisu_susfs_uname_legacy {
+          \tchar release[__NEW_UTS_LEN + 1];
+          \tchar version[__NEW_UTS_LEN + 1];
+          \tint err;
+          };
+
+          static void ksu_susfs_copy_result(void __user *arg, size_t err_offset, int err)
+          {
+          \tif (copy_to_user((char __user *)arg + err_offset, &err, sizeof(err)))
+          \t\tpr_err("susfs legacy bridge: failed to copy result\\n");
+          }
+
+          int ksu_handle_susfs_cmd(unsigned int cmd, void __user **arg)
+          {
+          \tvoid __user *uarg = *arg;
+
+          \tswitch (cmd) {
+          #ifdef CONFIG_KSU_SUSFS_SPOOF_UNAME
+          \tcase CMD_SUSFS_SET_UNAME: {
+          \t\tint err = susfs_set_uname((struct st_susfs_uname __user *)uarg);
+          \t\tksu_susfs_copy_result(uarg,
+          \t\t\toffsetof(struct resukisu_susfs_uname_legacy, err), err);
+          \t\treturn 0;
+          \t}
+          #endif
+          #ifdef CONFIG_KSU_SUSFS_ENABLE_LOG
+          \tcase CMD_SUSFS_ENABLE_LOG: {
+          \t\tstruct resukisu_susfs_log_legacy info;
+          \t\tif (copy_from_user(&info, uarg, sizeof(info))) {
+          \t\t\tksu_susfs_copy_result(uarg,
+          \t\t\t\toffsetof(struct resukisu_susfs_log_legacy, err),
+          \t\t\t\t-EFAULT);
+          \t\t\treturn 0;
+          \t\t}
+          \t\tsusfs_set_log(info.enabled);
+          \t\tksu_susfs_copy_result(uarg,
+          \t\t\toffsetof(struct resukisu_susfs_log_legacy, err), 0);
+          \t\treturn 0;
+          \t}
+          #endif
+          #ifdef CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
+          \tcase CMD_SUSFS_SET_CMDLINE_OR_BOOTCONFIG: {
+          \t\tint err = susfs_set_cmdline_or_bootconfig((char __user *)uarg);
+          \t\t/* Current ReSukiSU userspace uses an 8192-byte payload. */
+          \t\tksu_susfs_copy_result(uarg, 8192, err);
+          \t\treturn 0;
+          \t}
+          #endif
+          \tcase CMD_SUSFS_SHOW_VERSION: {
+          \t\tchar version[16] = { 0 };
+          \t\tint err = 0;
+          \t\tstrncpy(version, SUSFS_VERSION, sizeof(version) - 1);
+          \t\tif (copy_to_user(uarg, version, sizeof(version)))
+          \t\t\terr = -EFAULT;
+          \t\tksu_susfs_copy_result(uarg, sizeof(version), err);
+          \t\treturn 0;
+          \t}
+          \tcase CMD_SUSFS_SHOW_VARIANT: {
+          \t\tchar variant[16] = { 0 };
+          \t\tint err = 0;
+          \t\tstrncpy(variant, SUSFS_VARIANT, sizeof(variant) - 1);
+          \t\tif (copy_to_user(uarg, variant, sizeof(variant)))
+          \t\t\terr = -EFAULT;
+          \t\tksu_susfs_copy_result(uarg, sizeof(variant), err);
+          \t\treturn 0;
+          \t}
+          \tcase CMD_SUSFS_SHOW_ENABLED_FEATURES: {
+          \t\tstatic const char features[] = ""
+          #ifdef CONFIG_KSU_SUSFS_SPOOF_UNAME
+          \t\t\t"CONFIG_KSU_SUSFS_SPOOF_UNAME\\n"
+          #endif
+          #ifdef CONFIG_KSU_SUSFS_ENABLE_LOG
+          \t\t\t"CONFIG_KSU_SUSFS_ENABLE_LOG\\n"
+          #endif
+          #ifdef CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
+          \t\t\t"CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG\\n"
+          #endif
+          \t\t\t;
+          \t\tint err = 0;
+          \t\tif (copy_to_user(uarg, features, sizeof(features)))
+          \t\t\terr = -EFAULT;
+          \t\t/* Current ReSukiSU reserves 8192 bytes for this string. */
+          \t\tksu_susfs_copy_result(uarg, 8192, err);
+          \t\treturn 0;
+          \t}
+          \tdefault:
+          \t\t/*
+          \t\t * ReSukiSU initializes modern command result fields to
+          \t\t * ERR_CMD_NOT_SUPPORTED (126). Leave them untouched for
+          \t\t * v2-only operations that v1.5.5 cannot safely translate.
+          \t\t */
+          \t\treturn 0;
+          \t}
+          }
+          #endif
+          """
+          compat = compat.replace("\\n          ", "\\n").lstrip()
+          p.write_text(t[:start] + compat + t[end:])
+          PY
 
           # The upstream 4.14 patch currently carries a few trailing spaces.
           # Normalize only whitespace before enforcing a clean diff.
