@@ -63,11 +63,16 @@ jobs:
           mkdir -p toolchains/clang-r383902 toolchains/gcc49
 
           if [ ! -x toolchains/clang-r383902/bin/clang ]; then
-            # Stock A032FXXS9CZA1 reports Android clang 11.0.1, build 6443078
-            # (clang-r383902), so use that exact AOSP prebuilt generation.
-            wget -q \
-              "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/0e9e7035bf8ad42437c6156e5950eab13655b26c/clang-r383902.tar.gz" \
-              -O clang.tar.gz
+            # Stock A032FXXS9CZA1 reports Android clang 11.0.1, build 6443078.
+            # Gitiles archive endpoints occasionally return transient HTTP 404/5xx,
+            # so retry r383902 and fall back to the sibling r383902b archive from
+            # the same immutable AOSP prebuilt revision.
+            CLANG_BASE="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/0e9e7035bf8ad42437c6156e5950eab13655b26c"
+            if ! curl -fL --retry 5 --retry-delay 2 --retry-all-errors \
+              "$CLANG_BASE/clang-r383902.tar.gz" -o clang.tar.gz; then
+              curl -fL --retry 5 --retry-delay 2 --retry-all-errors \
+                "$CLANG_BASE/clang-r383902b.tar.gz" -o clang.tar.gz
+            fi
             tar -xf clang.tar.gz -C toolchains/clang-r383902
             rm clang.tar.gz
           fi
