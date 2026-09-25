@@ -792,6 +792,12 @@ jobs:
           "${GITHUB_WORKSPACE}/toolchains/clang-r383902/bin/clang" --version | head -n 1
           test -x "${GITHUB_WORKSPACE}/toolchains/gcc49/bin/aarch64-linux-android-gcc"
 
+      - name: Save Android toolchains cache
+        uses: actions/cache/save@v4
+        with:
+          path: toolchains
+          key: a032f-r383902-gcc49-ee0dbcb-v1
+
       - name: Configure from Samsung A032F stock defconfig
         shell: bash
         run: |
