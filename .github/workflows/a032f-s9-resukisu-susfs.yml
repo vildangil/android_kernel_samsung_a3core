@@ -459,7 +459,7 @@ jobs:
           )
           if work not in t:
               raise SystemExit("ReSukiSU setuid SUSFS extra-work block not found")
-          t = t.replace(work, "    /* v1.5.5 has no susfs_extra_works backend. */\n", 1)
+          t = t.replace(work, "    /* Legacy SUSFS needs no extra workqueue backend. */\n", 1)
           p.write_text(t)
 
           p = Path("KernelSU/kernel/feature/kernel_umount.c")
@@ -471,7 +471,7 @@ jobs:
           )
           if work not in t:
               raise SystemExit("ReSukiSU kernel_umount SUSFS extra-work block not found")
-          t = t.replace(work, "    /* v1.5.5 has no susfs_extra_works backend. */\n", 1)
+          t = t.replace(work, "    /* Legacy SUSFS needs no extra workqueue backend. */\n", 1)
           t = t.replace(
               "susfs_set_current_proc_umounted();",
               "current->susfs_task_state |= TASK_STRUCT_NON_ROOT_USER_APP_PROC;",
