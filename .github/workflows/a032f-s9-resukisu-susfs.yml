@@ -254,23 +254,33 @@ jobs:
               seg = seg.replace(needle, needle + hook, 1)
               p.write_text(t[:start] + seg + t[end:])
 
-          # Samsung's 4.14 fanotify callback still has the stock two-argument
-          # signature, while the SUSFS fdinfo wrapper passes struct file *.
-          # Keep both signatures valid so the source remains buildable with
-          # and without CONFIG_KSU_SUSFS_SUS_MOUNT.
+          # Samsung's fanotify callback is stock/two-argument, but after the
+          # SUSFS show_fdinfo hunk CONFIG_KSU_SUSFS_SUS_MOUNT passes file too.
+          # Match whitespace/formatted declarations robustly because vendor
+          # trees and patch versions do not always keep it on one line.
+          import re
           p = Path("fs/notify/fdinfo.c")
           t = p.read_text()
-          old = "static void fanotify_fdinfo(struct seq_file *m, struct fsnotify_mark *mark)\\n"
-          if old not in t:
-              raise SystemExit("fs/notify/fdinfo.c: fanotify_fdinfo signature not found")
-          new = """#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+          three_arg = re.compile(
+              r"static\\s+void\\s+fanotify_fdinfo\\(\\s*struct\\s+seq_file\\s*\\*m\\s*,"
+              r"\\s*struct\\s+fsnotify_mark\\s*\\*mark\\s*,\\s*struct\\s+file\\s*\\*file\\s*\\)"
+          )
+          if not three_arg.search(t):
+              two_arg = re.compile(
+                  r"static\\s+void\\s+fanotify_fdinfo\\(\\s*struct\\s+seq_file\\s*\\*m\\s*,"
+                  r"\\s*struct\\s+fsnotify_mark\\s*\\*mark\\s*\\)"
+              )
+              new = """#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
           static void fanotify_fdinfo(struct seq_file *m, struct fsnotify_mark *mark, struct file *file)
           #else
           static void fanotify_fdinfo(struct seq_file *m, struct fsnotify_mark *mark)
-          #endif
-          """
-          t = t.replace(old, new, 1)
-          p.write_text(t)
+          #endif"""
+              t, n = two_arg.subn(new, t, count=1)
+              if n != 1:
+                  pos = t.find("fanotify_fdinfo")
+                  context = t[max(0, pos - 200):pos + 300] if pos >= 0 else "<not present>"
+                  raise SystemExit("fs/notify/fdinfo.c: cannot adapt fanotify_fdinfo:\n" + context)
+              p.write_text(t)
 
           for rel in expected:
               Path(rel).unlink()
@@ -410,6 +420,95 @@ jobs:
           """
           compat = compat.replace("\\n          ", "\\n").lstrip()
           p.write_text(t[:start] + compat + t[end:])
+
+          # ReSukiSU main uses the newer SUSFS per-task helpers.  The legacy
+          # 4.14 SUSFS ABI has only TASK_STRUCT_NON_ROOT_USER_APP_PROC, which
+          # is exactly the bit all v1.5.5 VFS hide hooks inspect.  Translate
+          # the modern states onto that legacy bit and skip v2-only extra work.
+          p = Path("KernelSU/kernel/feature/sucompat.h")
+          t = p.read_text()
+          old = (
+              "#define ksu_is_current_proc_unprivillege susfs_is_current_proc_no_su\n"
+              "#define ksu_set_current_proc_unprivillege susfs_set_current_proc_no_su\n"
+              "#define ksu_clear_current_proc_unprivillege susfs_clear_current_proc_no_su\n"
+          )
+          new = (
+              "#define ksu_is_current_proc_unprivillege() "
+              "!!(current->susfs_task_state & TASK_STRUCT_NON_ROOT_USER_APP_PROC)\n"
+              "#define ksu_set_current_proc_unprivillege() "
+              "(current->susfs_task_state |= TASK_STRUCT_NON_ROOT_USER_APP_PROC)\n"
+              "#define ksu_clear_current_proc_unprivillege() "
+              "(current->susfs_task_state &= ~TASK_STRUCT_NON_ROOT_USER_APP_PROC)\n"
+          )
+          if old not in t:
+              raise SystemExit("ReSukiSU sucompat legacy state aliases not found")
+          p.write_text(t.replace(old, new, 1))
+
+          p = Path("KernelSU/kernel/hook/setuid_hook.c")
+          t = p.read_text()
+          t = t.replace("extern struct work_struct susfs_extra_works;\n", "", 1)
+          for call in (
+              "susfs_set_current_proc_no_su();",
+              "susfs_set_current_proc_umounted();",
+              "susfs_set_current_proc_umounted_for_zygote_next();",
+          ):
+              t = t.replace(
+                  call,
+                  "current->susfs_task_state |= TASK_STRUCT_NON_ROOT_USER_APP_PROC;"
+              )
+          work = (
+              "    if (!work_pending(&susfs_extra_works))\n"
+              "        schedule_work(&susfs_extra_works);\n"
+          )
+          if work not in t:
+              raise SystemExit("ReSukiSU setuid SUSFS extra-work block not found")
+          t = t.replace(work, "    /* v1.5.5 has no susfs_extra_works backend. */\n", 1)
+          p.write_text(t)
+
+          p = Path("KernelSU/kernel/feature/kernel_umount.c")
+          t = p.read_text()
+          t = t.replace("extern struct work_struct susfs_extra_works;\n", "", 1)
+          work = (
+              "    if (!work_pending(&susfs_extra_works))\n"
+              "        schedule_work(&susfs_extra_works);\n"
+          )
+          if work not in t:
+              raise SystemExit("ReSukiSU kernel_umount SUSFS extra-work block not found")
+          t = t.replace(work, "    /* v1.5.5 has no susfs_extra_works backend. */\n", 1)
+          t = t.replace(
+              "susfs_set_current_proc_umounted();",
+              "current->susfs_task_state |= TASK_STRUCT_NON_ROOT_USER_APP_PROC;",
+          )
+          p.write_text(t)
+
+          p = Path("KernelSU/kernel/supercall/dispatch.c")
+          t = p.read_text()
+          t = t.replace(
+              "susfs_is_current_proc_umounted()",
+              "!!(current->susfs_task_state & TASK_STRUCT_NON_ROOT_USER_APP_PROC)",
+          )
+          p.write_text(t)
+
+          forbidden = (
+              "susfs_set_current_proc_no_su(",
+              "susfs_set_current_proc_umounted(",
+              "susfs_set_current_proc_umounted_for_zygote_next(",
+              "susfs_is_current_proc_umounted(",
+              "susfs_extra_works",
+          )
+          leftovers = []
+          for q in Path("KernelSU/kernel").rglob("*"):
+              if not q.is_file():
+                  continue
+              try:
+                  txt = q.read_text()
+              except UnicodeDecodeError:
+                  continue
+              for sym in forbidden:
+                  if sym in txt:
+                      leftovers.append(f"{q}:{sym}")
+          if leftovers:
+              raise SystemExit("Legacy SUSFS compatibility leftovers: " + ", ".join(leftovers))
           PY
 
           # The upstream 4.14 patch currently carries a few trailing spaces.
