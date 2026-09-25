@@ -1,0 +1,930 @@
+name: Build A032F S9 ReSukiSU + SUSFS
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 3 * * 0'
+  push:
+    branches:
+      - chatgpt/a032f-s9-resukisu-susfs
+    paths:
+      - .github/workflows/a032f-s9-resukisu-susfs.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: a032f-s9-resukisu-susfs-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    env:
+      ARCH: arm64
+      KERNEL_ROOT: ${{ github.workspace }}
+      OUT: ${{ github.workspace }}/out
+      STOCK_KERNEL_RELEASE: 4.14.199-27418755-abA032FXXS9CZA1
+      LOCALVERSION: -27418755-abA032FXXS9CZA1
+      BSP_BUILD_FAMILY: sharkl3
+      BSP_BUILD_ANDROID_OS: y
+      KBUILD_BUILD_USER: dpi
+      KBUILD_BUILD_HOST: 21DN4404
+      KBUILD_BUILD_VERSION: "2"
+      KBUILD_BUILD_TIMESTAMP: "Fri Jan 9 17:27:02 KST 2026"
+
+    steps:
+      - name: Checkout stock 4.14.199 source
+        uses: actions/checkout@v4
+        with:
+          ref: stock
+          fetch-depth: 1
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc bison build-essential ca-certificates ccache curl flex git \
+            libelf-dev libssl-dev make patch python3 rsync wget xz-utils zip
+
+      - name: Integrate latest ReSukiSU
+        shell: bash
+        run: |
+          set -euxo pipefail
+          curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash
+          test -f drivers/kernelsu/Kconfig
+          echo "RESUKISU_SHA=$(git -C KernelSU rev-parse HEAD)" >> "$GITHUB_ENV"
+          git -C KernelSU log -1 --oneline
+
+      - name: Integrate latest SUSFS for kernel 4.14
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          # ReSukiSU already implements the manager/KernelSU side of SUSFS.
+          # Only apply simonpunk's kernel-side 4.14 patch and source files.
+          git clone --depth 1 --branch kernel-4.14 \
+            https://gitlab.com/simonpunk/susfs4ksu.git susfs4ksu
+
+          cp -a susfs4ksu/kernel_patches/fs/. fs/
+          cp -a susfs4ksu/kernel_patches/include/linux/. include/linux/
+
+          set +e
+          patch --batch --forward -p1 < susfs4ksu/kernel_patches/50_add_susfs_in_kernel-4.14.patch
+          PATCH_RC=$?
+          set -e
+
+          if [ "$PATCH_RC" -ne 0 ]; then
+            # Samsung's A032F tree has a few vendor-only lines around five
+            # upstream 4.14 hunks. All functional hunks apply; adapt only the
+            # rejected context-sensitive pieces and fail on any new reject.
+            python3 - <<'PY'
+          from pathlib import Path
+
+          expected = {
+              "fs/namei.c.rej",
+              "fs/namespace.c.rej",
+              "fs/notify/fdinfo.c.rej",
+              "fs/proc/task_mmu.c.rej",
+              "fs/readdir.c.rej",
+          }
+          found = {str(p) for p in Path(".").rglob("*.rej")}
+          if found != expected:
+              raise SystemExit(f"Unexpected SUSFS rejects: {sorted(found)} (expected {sorted(expected)})")
+
+          def put_after(path, needle, addition):
+              p = Path(path)
+              t = p.read_text()
+              if addition.strip() in t:
+                  return
+              if t.count(needle) != 1:
+                  raise SystemExit(f"{path}: marker count for {needle!r} is {t.count(needle)}")
+              p.write_text(t.replace(needle, needle + addition, 1))
+
+          put_after(
+              "fs/namei.c",
+              "#include <linux/avc_backtrace.h>\n",
+              """#if defined(CONFIG_KSU_SUSFS_SUS_PATH) || defined(CONFIG_KSU_SUSFS_OPEN_REDIRECT)
+          #include <linux/susfs_def.h>
+          #endif
+          """,
+          )
+
+          put_after(
+              "fs/proc/task_mmu.c",
+              "#include <linux/ctype.h>\n",
+              """#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT
+          #include <linux/susfs_def.h>
+          #endif
+          """,
+          )
+
+          put_after(
+              "fs/namespace.c",
+              "#include <linux/fslog.h>\n",
+              """#if defined(CONFIG_KSU_SUSFS_SUS_MOUNT) || defined(CONFIG_KSU_SUSFS_TRY_UMOUNT)
+          #include <linux/susfs_def.h>
+          #endif
+
+          #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+          extern bool susfs_is_current_ksu_domain(void);
+          extern bool susfs_is_current_zygote_domain(void);
+
+          static DEFINE_IDA(susfs_mnt_id_ida);
+          static DEFINE_IDA(susfs_mnt_group_ida);
+          static int susfs_mnt_id_start = DEFAULT_SUS_MNT_ID;
+          static int susfs_mnt_group_start = DEFAULT_SUS_MNT_GROUP_ID;
+
+          #define CL_ZYGOTE_COPY_MNT_NS BIT(24) /* used by copy_mnt_ns() */
+          #define CL_COPY_MNT_NS BIT(25) /* used by copy_mnt_ns() */
+          #endif
+
+          #ifdef CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT
+          extern void susfs_auto_add_sus_ksu_default_mount(const char __user *to_pathname);
+          bool susfs_is_auto_add_sus_ksu_default_mount_enabled = true;
+          #endif
+          #ifdef CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT
+          extern int susfs_auto_add_sus_bind_mount(const char *pathname, struct path *path_target);
+          bool susfs_is_auto_add_sus_bind_mount_enabled = true;
+          #endif
+          #ifdef CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT
+          extern void susfs_auto_add_try_umount_for_bind_mount(struct path *path);
+          bool susfs_is_auto_add_try_umount_for_bind_mount_enabled = true;
+          #endif
+
+          """,
+          )
+
+          p = Path("fs/readdir.c")
+          t = p.read_text()
+          start = t.index("static int compat_fillonedir(")
+          end = t.index("\n}\n\nCOMPAT_SYSCALL_DEFINE3(old_readdir", start)
+          seg = t[start:end]
+          hook = """#ifdef CONFIG_KSU_SUSFS_SUS_PATH
+          \tif (likely(current->susfs_task_state & TASK_STRUCT_NON_ROOT_USER_APP_PROC) &&
+          \t\t\tsusfs_sus_ino_for_filldir64(ino)) {
+          \t\treturn 0;
+          \t}
+          #endif
+          """
+          if "susfs_sus_ino_for_filldir64(ino)" not in seg:
+              needle = "\tif (buf->result)\n\t\treturn -EINVAL;\n"
+              if needle not in seg:
+                  raise SystemExit("fs/readdir.c: compat_fillonedir insertion point not found")
+              seg = seg.replace(needle, needle + hook, 1)
+              p.write_text(t[:start] + seg + t[end:])
+
+          p = Path("fs/notify/fdinfo.c")
+          t = p.read_text()
+          start = t.index("static void inotify_fdinfo(")
+          end = t.index("\nvoid inotify_show_fdinfo", start)
+          seg = t[start:end]
+          if "out_seq_printf:" not in seg:
+              needle = "\t\tu32 mask = mark->mask & IN_ALL_EVENTS;\n"
+              if needle not in seg:
+                  raise SystemExit("fs/notify/fdinfo.c: vendor mask insertion point not found")
+              hook = """#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+          \t\tif (likely(current->susfs_task_state & TASK_STRUCT_NON_ROOT_USER_APP_PROC) &&
+          \t\t\t\tunlikely(inode->i_state & INODE_STATE_SUS_KSTAT)) {
+          \t\t\tstruct path path;
+          \t\t\tchar *pathname = kmalloc(PAGE_SIZE, GFP_KERNEL);
+          \t\t\tchar *dpath;
+          \t\t\tif (!pathname)
+          \t\t\t\tgoto out_seq_printf;
+          \t\t\tdpath = d_path(&file->f_path, pathname, PAGE_SIZE);
+          \t\t\tif (!dpath)
+          \t\t\t\tgoto out_free_pathname;
+          \t\t\tif (kern_path(dpath, 0, &path))
+          \t\t\t\tgoto out_free_pathname;
+          \t\t\tseq_printf(m, "inotify wd:%x ino:%lx sdev:%x mask:%x ignored_mask:0 ",
+          \t\t\t\tinode_mark->wd, path.dentry->d_inode->i_ino,
+          \t\t\t\tpath.dentry->d_inode->i_sb->s_dev, mask);
+          \t\t\tshow_mark_fhandle(m, path.dentry->d_inode);
+          \t\t\tseq_putc(m, '\\n');
+          \t\t\tiput(inode);
+          \t\t\tpath_put(&path);
+          \t\t\tkfree(pathname);
+          \t\t\treturn;
+          out_free_pathname:
+          \t\t\tkfree(pathname);
+          \t\t}
+          out_seq_printf:
+          #endif
+          """
+              seg = seg.replace(needle, needle + hook, 1)
+              p.write_text(t[:start] + seg + t[end:])
+
+          # Samsung's fanotify callback is stock/two-argument, but the
+          # SUSFS fdinfo hunk calls it with file under CONFIG_KSU_SUSFS_SUS_MOUNT.
+          # This vendor tree keeps the declaration on one line, so use an exact,
+          # fail-closed replacement instead of a fragile regex.
+          p = Path("fs/notify/fdinfo.c")
+          t = p.read_text()
+          three_arg = "static void fanotify_fdinfo(struct seq_file *m, struct fsnotify_mark *mark, struct file *file)"
+          two_arg = "static void fanotify_fdinfo(struct seq_file *m, struct fsnotify_mark *mark)"
+          if three_arg not in t:
+              if t.count(two_arg) != 1:
+                  pos = t.find("fanotify_fdinfo")
+                  context = t[max(0, pos - 200):pos + 300] if pos >= 0 else "<not present>"
+                  raise SystemExit("fs/notify/fdinfo.c: cannot adapt fanotify_fdinfo:\n" + context)
+              new = """#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+          static void fanotify_fdinfo(struct seq_file *m, struct fsnotify_mark *mark, struct file *file)
+          #else
+          static void fanotify_fdinfo(struct seq_file *m, struct fsnotify_mark *mark)
+          #endif"""
+              p.write_text(t.replace(two_arg, new, 1))
+
+          for rel in expected:
+              Path(rel).unlink()
+
+          if list(Path(".").rglob("*.rej")):
+              raise SystemExit("SUSFS reject files remain after A032F adaptation")
+          PY
+          fi
+
+          # The kernel-side patch must not overwrite ReSukiSU's native
+          # manager-side SUSFS implementation.
+          git -C KernelSU reset --hard HEAD
+          git -C KernelSU clean -fd
+
+          # ReSukiSU main speaks the newer SUSFS reboot ABI, while the
+          # maintained kernel-4.14 branch is v1.5.5. Bridge only commands
+          # whose wire layouts can be translated safely. Newer v2-only
+          # commands deliberately remain unsupported instead of corrupting
+          # legacy v1.5.5 structures in kernel memory.
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path("KernelSU/kernel/supercall/dispatch.c")
+          t = p.read_text()
+          old_include = "#ifdef CONFIG_KSU_SUSFS\n#include <linux/susfs_def.h>\n#endif\n"
+          new_include = "#ifdef CONFIG_KSU_SUSFS\n#include <linux/susfs_def.h>\n#include <linux/susfs.h>\n#endif\n"
+          if old_include not in t:
+              raise SystemExit("ReSukiSU dispatch SUSFS include block not found")
+          t = t.replace(old_include, new_include, 1)
+
+          start = t.index("#ifdef CONFIG_KSU_SUSFS\nint ksu_handle_susfs_cmd(")
+          marker = "\n#endif\n\n#ifdef CONFIG_KSU_TOOLKIT_SUPPORT"
+          end = t.index(marker, start) + len("\n#endif")
+
+          compat = r"""
+          #ifdef CONFIG_KSU_SUSFS
+          struct resukisu_susfs_log_legacy {
+          \tbool enabled;
+          \tint err;
+          };
+
+          struct resukisu_susfs_uname_legacy {
+          \tchar release[__NEW_UTS_LEN + 1];
+          \tchar version[__NEW_UTS_LEN + 1];
+          \tint err;
+          };
+
+          static void ksu_susfs_copy_result(void __user *arg, size_t err_offset, int err)
+          {
+          \tif (copy_to_user((char __user *)arg + err_offset, &err, sizeof(err)))
+          \t\tpr_err("susfs legacy bridge: failed to copy result\n");
+          }
+
+          int ksu_handle_susfs_cmd(unsigned int cmd, void __user **arg)
+          {
+          \tvoid __user *uarg = *arg;
+
+          \tswitch (cmd) {
+          #ifdef CONFIG_KSU_SUSFS_SPOOF_UNAME
+          \tcase CMD_SUSFS_SET_UNAME: {
+          \t\tint err = susfs_set_uname((struct st_susfs_uname __user *)uarg);
+          \t\tksu_susfs_copy_result(uarg,
+          \t\t\toffsetof(struct resukisu_susfs_uname_legacy, err), err);
+          \t\treturn 0;
+          \t}
+          #endif
+          #ifdef CONFIG_KSU_SUSFS_ENABLE_LOG
+          \tcase CMD_SUSFS_ENABLE_LOG: {
+          \t\tstruct resukisu_susfs_log_legacy info;
+          \t\tif (copy_from_user(&info, uarg, sizeof(info))) {
+          \t\t\tksu_susfs_copy_result(uarg,
+          \t\t\t\toffsetof(struct resukisu_susfs_log_legacy, err),
+          \t\t\t\t-EFAULT);
+          \t\t\treturn 0;
+          \t\t}
+          \t\tsusfs_set_log(info.enabled);
+          \t\tksu_susfs_copy_result(uarg,
+          \t\t\toffsetof(struct resukisu_susfs_log_legacy, err), 0);
+          \t\treturn 0;
+          \t}
+          #endif
+          #ifdef CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
+          \tcase CMD_SUSFS_SET_CMDLINE_OR_BOOTCONFIG: {
+          \t\tint err = susfs_set_cmdline_or_bootconfig((char __user *)uarg);
+          \t\t/* Current ReSukiSU userspace uses an 8192-byte payload. */
+          \t\tksu_susfs_copy_result(uarg, 8192, err);
+          \t\treturn 0;
+          \t}
+          #endif
+          \tcase CMD_SUSFS_SHOW_VERSION: {
+          \t\tchar version[16] = { 0 };
+          \t\tint err = 0;
+          \t\tstrncpy(version, SUSFS_VERSION, sizeof(version) - 1);
+          \t\tif (copy_to_user(uarg, version, sizeof(version)))
+          \t\t\terr = -EFAULT;
+          \t\tksu_susfs_copy_result(uarg, sizeof(version), err);
+          \t\treturn 0;
+          \t}
+          \tcase CMD_SUSFS_SHOW_VARIANT: {
+          \t\tchar variant[16] = { 0 };
+          \t\tint err = 0;
+          \t\tstrncpy(variant, SUSFS_VARIANT, sizeof(variant) - 1);
+          \t\tif (copy_to_user(uarg, variant, sizeof(variant)))
+          \t\t\terr = -EFAULT;
+          \t\tksu_susfs_copy_result(uarg, sizeof(variant), err);
+          \t\treturn 0;
+          \t}
+          \tcase CMD_SUSFS_SHOW_ENABLED_FEATURES: {
+          \t\tstatic const char features[] = ""
+          #ifdef CONFIG_KSU_SUSFS_SPOOF_UNAME
+          \t\t\t"CONFIG_KSU_SUSFS_SPOOF_UNAME\n"
+          #endif
+          #ifdef CONFIG_KSU_SUSFS_ENABLE_LOG
+          \t\t\t"CONFIG_KSU_SUSFS_ENABLE_LOG\n"
+          #endif
+          #ifdef CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
+          \t\t\t"CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG\n"
+          #endif
+          \t\t\t;
+          \t\tint err = 0;
+          \t\tif (copy_to_user(uarg, features, sizeof(features)))
+          \t\t\terr = -EFAULT;
+          \t\t/* Current ReSukiSU reserves 8192 bytes for this string. */
+          \t\tksu_susfs_copy_result(uarg, 8192, err);
+          \t\treturn 0;
+          \t}
+          \tdefault:
+          \t\t/*
+          \t\t * ReSukiSU initializes modern command result fields to
+          \t\t * ERR_CMD_NOT_SUPPORTED (126). Leave them untouched for
+          \t\t * v2-only operations that v1.5.5 cannot safely translate.
+          \t\t */
+          \t\treturn 0;
+          \t}
+          }
+          #endif
+          """
+          compat = compat.replace(r"\t", "	").replace("\n          ", "\n").lstrip()
+          p.write_text(t[:start] + compat + t[end:])
+
+          # ReSukiSU main uses the newer SUSFS per-task helpers.  The legacy
+          # 4.14 SUSFS ABI has only TASK_STRUCT_NON_ROOT_USER_APP_PROC, which
+          # is exactly the bit all v1.5.5 VFS hide hooks inspect.  Translate
+          # the modern states onto that legacy bit and skip v2-only extra work.
+          p = Path("KernelSU/kernel/feature/sucompat.h")
+          t = p.read_text()
+          old = (
+              "#define ksu_is_current_proc_unprivillege susfs_is_current_proc_no_su\n"
+              "#define ksu_set_current_proc_unprivillege susfs_set_current_proc_no_su\n"
+              "#define ksu_clear_current_proc_unprivillege susfs_clear_current_proc_no_su\n"
+          )
+          new = (
+              "#define ksu_is_current_proc_unprivillege() "
+              "!!(current->susfs_task_state & TASK_STRUCT_NON_ROOT_USER_APP_PROC)\n"
+              "#define ksu_set_current_proc_unprivillege() "
+              "(current->susfs_task_state |= TASK_STRUCT_NON_ROOT_USER_APP_PROC)\n"
+              "#define ksu_clear_current_proc_unprivillege() "
+              "(current->susfs_task_state &= ~TASK_STRUCT_NON_ROOT_USER_APP_PROC)\n"
+          )
+          if old not in t:
+              raise SystemExit("ReSukiSU sucompat legacy state aliases not found")
+          p.write_text(t.replace(old, new, 1))
+
+          p = Path("KernelSU/kernel/hook/setuid_hook.c")
+          t = p.read_text()
+          t = t.replace("extern struct work_struct susfs_extra_works;\n", "", 1)
+          for call in (
+              "susfs_set_current_proc_no_su();",
+              "susfs_set_current_proc_umounted();",
+              "susfs_set_current_proc_umounted_for_zygote_next();",
+          ):
+              t = t.replace(
+                  call,
+                  "current->susfs_task_state |= TASK_STRUCT_NON_ROOT_USER_APP_PROC;"
+              )
+          work = (
+              "    if (!work_pending(&susfs_extra_works))\n"
+              "        schedule_work(&susfs_extra_works);\n"
+          )
+          if work not in t:
+              raise SystemExit("ReSukiSU setuid SUSFS extra-work block not found")
+          t = t.replace(work, "    /* Legacy SUSFS needs no extra workqueue backend. */\n", 1)
+          p.write_text(t)
+
+          p = Path("KernelSU/kernel/feature/kernel_umount.c")
+          t = p.read_text()
+          t = t.replace("extern struct work_struct susfs_extra_works;\n", "", 1)
+          work = (
+              "    if (!work_pending(&susfs_extra_works))\n"
+              "        schedule_work(&susfs_extra_works);\n"
+          )
+          if work not in t:
+              raise SystemExit("ReSukiSU kernel_umount SUSFS extra-work block not found")
+          t = t.replace(work, "    /* Legacy SUSFS needs no extra workqueue backend. */\n", 1)
+          t = t.replace(
+              "susfs_set_current_proc_umounted();",
+              "current->susfs_task_state |= TASK_STRUCT_NON_ROOT_USER_APP_PROC;",
+          )
+          p.write_text(t)
+
+          p = Path("KernelSU/kernel/supercall/dispatch.c")
+          t = p.read_text()
+          t = t.replace(
+              "susfs_is_current_proc_umounted()",
+              "!!(current->susfs_task_state & TASK_STRUCT_NON_ROOT_USER_APP_PROC)",
+          )
+          # Current ReSukiSU starts the newer SUSFS sdcard monitor at boot complete.
+          # Legacy kernel-4.14 SUSFS v1.5.5 has no such backend; omit only this
+          # optional v2 helper while retaining the rest of boot-complete handling.
+          t = t.replace(
+              "#ifdef CONFIG_KSU_SUSFS\n                susfs_start_sdcard_monitor_fn();\n#endif\n",
+              "",
+          )
+          p.write_text(t)
+
+          forbidden = (
+              "susfs_set_current_proc_no_su(",
+              "susfs_set_current_proc_umounted(",
+              "susfs_set_current_proc_umounted_for_zygote_next(",
+              "susfs_is_current_proc_umounted(",
+              "susfs_extra_works",
+          )
+          leftovers = []
+          for q in Path("KernelSU/kernel").rglob("*"):
+              if not q.is_file():
+                  continue
+              try:
+                  txt = q.read_text()
+              except UnicodeDecodeError:
+                  continue
+              for sym in forbidden:
+                  if sym in txt:
+                      leftovers.append(f"{q}:{sym}")
+          if leftovers:
+              raise SystemExit("Legacy SUSFS compatibility leftovers: " + ", ".join(leftovers))
+
+          # Legacy 4.14 SUSFS lacks the reboot magic constant expected by current ReSukiSU.
+          p = Path("include/linux/susfs.h")
+          t = p.read_text()
+          if "SUSFS_MAGIC" not in t:
+              t += "\n#ifndef SUSFS_MAGIC\n#define SUSFS_MAGIC 0xFAFAFAFA\n#endif\n"
+              p.write_text(t)
+          PY
+
+          # The upstream 4.14 patch currently carries a few trailing spaces.
+          # Normalize only whitespace before enforcing a clean diff.
+          sed -i 's/[[:space:]]\+$//' fs/namespace.c fs/overlayfs/readdir.c
+          git diff --check
+          test -f fs/susfs.c
+          test -f include/linux/susfs.h
+
+          echo "SUSFS_SHA=$(git -C susfs4ksu rev-parse HEAD)" >> "$GITHUB_ENV"
+          SUSFS_VERSION="$(sed -n 's/^#define SUSFS_VERSION[[:space:]]*"\([^"]*\)".*/\1/p' include/linux/susfs.h | head -n1)"
+          echo "SUSFS_VERSION=$SUSFS_VERSION" >> "$GITHUB_ENV"
+          echo "SUSFS version: $SUSFS_VERSION"
+
+      - name: Patch missing ReSukiSU SUSFS inline hooks
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace_once(path, old, new):
+              p = Path(path)
+              text = p.read_text()
+              if new in text:
+                  return
+              if old not in text:
+                  raise SystemExit(f"{path}: expected anchor not found: {old[:80]!r}")
+              p.write_text(text.replace(old, new, 1))
+
+          # ReSukiSU currently uses struct filename** for SUSFS faccess/stat.
+          # On this Linux 4.14 tree the syscall hooks still expose user pointers,
+          # so use ReSukiSU's legacy implementation for < 6.1 while keeping its
+          # modern implementation intact for newer kernels.
+          replace_once(
+              "KernelSU/kernel/feature/sucompat.h",
+              "#ifdef CONFIG_KSU_SUSFS\n"
+              "int ksu_handle_faccessat(int *dfd, struct filename **filename, int *mode, int *__unused_flags);\n"
+              "int ksu_handle_stat(int *dfd, struct filename **filename, int *flags);\n",
+              "#if defined(CONFIG_KSU_SUSFS) && LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)\n"
+              "int ksu_handle_faccessat(int *dfd, struct filename **filename, int *mode, int *__unused_flags);\n"
+              "int ksu_handle_stat(int *dfd, struct filename **filename, int *flags);\n",
+          )
+          replace_once(
+              "KernelSU/kernel/feature/sucompat.c",
+              "#ifdef CONFIG_KSU_SUSFS\n"
+              "int ksu_handle_faccessat(int *dfd, struct filename **filename, int *mode, int *__unused_flags)\n",
+              "#if defined(CONFIG_KSU_SUSFS) && LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)\n"
+              "int ksu_handle_faccessat(int *dfd, struct filename **filename, int *mode, int *__unused_flags)\n",
+          )
+          replace_once(
+              "KernelSU/kernel/feature/sucompat.c",
+              "#ifdef CONFIG_KSU_SUSFS\n"
+              "int ksu_handle_stat(int *dfd, struct filename **filename, int *flags)\n",
+              "#if defined(CONFIG_KSU_SUSFS) && LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)\n"
+              "int ksu_handle_stat(int *dfd, struct filename **filename, int *flags)\n",
+          )
+
+          # ReSukiSU SUSFS-inline mode must use the current direct handlers;
+          # the old boolean-gated KernelSU hooks are explicitly rejected by
+          # ReSukiSU's inline_hook_check.mk.
+
+          sysc = Path("kernel/sys.c").read_text()
+          if "ksu_handle_setresuid" not in sysc:
+              replace_once(
+                  "kernel/sys.c",
+                  "/*\n * This function implements a generic ability to update ruid, euid,\n",
+                  "#ifdef CONFIG_KSU_SUSFS\n"
+                  "extern int ksu_handle_setresuid(uid_t ruid, uid_t euid, uid_t suid);\n"
+                  "#endif\n\n"
+                  "/*\n * This function implements a generic ability to update ruid, euid,\n",
+              )
+              replace_once(
+                  "kernel/sys.c",
+                  "\tkuid_t kruid, keuid, ksuid;\n\n\tkruid = make_kuid(ns, ruid);\n",
+                  "\tkuid_t kruid, keuid, ksuid;\n\n"
+                  "#ifdef CONFIG_KSU_SUSFS\n"
+                  "\t(void)ksu_handle_setresuid(ruid, euid, suid);\n"
+                  "#endif\n\n"
+                  "\tkruid = make_kuid(ns, ruid);\n",
+              )
+
+          reboot = Path("kernel/reboot.c").read_text()
+          if "ksu_handle_sys_reboot" not in reboot:
+              replace_once(
+                  "kernel/reboot.c",
+                  "static DEFINE_MUTEX(reboot_mutex);\n",
+                  "static DEFINE_MUTEX(reboot_mutex);\n\n"
+                  "#ifdef CONFIG_KSU_SUSFS\n"
+                  "extern int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd, void __user **arg);\n"
+                  "#endif\n",
+              )
+              replace_once(
+                  "kernel/reboot.c",
+                  "\tchar buffer[256];\n\tint ret = 0;\n\n\t/* We only trust the superuser with rebooting the system. */\n",
+                  "\tchar buffer[256];\n\tint ret = 0;\n\n"
+                  "#ifdef CONFIG_KSU_SUSFS\n"
+                  "\tksu_handle_sys_reboot(magic1, magic2, cmd, &arg);\n"
+                  "#endif\n\n"
+                  "\t/* We only trust the superuser with rebooting the system. */\n",
+              )
+
+          rw = Path("fs/read_write.c").read_text()
+          if "ksu_handle_sys_read" not in rw:
+              replace_once(
+                  "fs/read_write.c",
+                  "SYSCALL_DEFINE3(read, unsigned int, fd, char __user *, buf, size_t, count)\n",
+                  "#ifdef CONFIG_KSU_SUSFS\n"
+                  "extern int ksu_handle_sys_read(unsigned int fd, char __user **buf_ptr, size_t *count_ptr);\n"
+                  "#endif\n\n"
+                  "SYSCALL_DEFINE3(read, unsigned int, fd, char __user *, buf, size_t, count)\n",
+              )
+              replace_once(
+                  "fs/read_write.c",
+                  "{\n\tstruct fd f = fdget_pos(fd);\n\tssize_t ret = -EBADF;\n\n\tif (f.file) {\n",
+                  "{\n\tstruct fd f = fdget_pos(fd);\n\tssize_t ret = -EBADF;\n\n"
+                  "#ifdef CONFIG_KSU_SUSFS\n"
+                  "\tksu_handle_sys_read(fd, &buf, &count);\n"
+                  "#endif\n\n"
+                  "\tif (f.file) {\n",
+              )
+
+          inp = Path("drivers/input/input.c").read_text()
+          if "ksu_handle_input_handle_event" not in inp:
+              replace_once(
+                  "drivers/input/input.c",
+                  "void input_event(struct input_dev *dev,\n",
+                  "#ifdef CONFIG_KSU_SUSFS\n"
+                  "extern int ksu_handle_input_handle_event(unsigned int *type, unsigned int *code, int *value);\n"
+                  "#endif\n\n"
+                  "void input_event(struct input_dev *dev,\n",
+              )
+              replace_once(
+                  "drivers/input/input.c",
+                  "{\n\tunsigned long flags;\n\n\tif (is_event_supported(type, dev->evbit, EV_MAX)) {\n",
+                  "{\n\tunsigned long flags;\n\n"
+                  "#ifdef CONFIG_KSU_SUSFS\n"
+                  "\tksu_handle_input_handle_event(&type, &code, &value);\n"
+                  "#endif\n\n"
+                  "\tif (is_event_supported(type, dev->evbit, EV_MAX)) {\n",
+              )
+
+          ex = Path("fs/exec.c").read_text()
+          if "ksu_handle_execveat" not in ex:
+              replace_once(
+                  "fs/exec.c",
+                  "/*\n * sys_execve() executes a new program.\n */\n",
+                  "#ifdef CONFIG_KSU_SUSFS\n"
+                  "__attribute__((hot))\n"
+                  "extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr,\n"
+                  "\t\tvoid *argv, void *envp, int *flags);\n"
+                  "__attribute__((hot))\n"
+                  "extern int ksu_handle_post_execveat(int *fd, struct filename **filename_ptr,\n"
+                  "\t\tvoid *argv, void *envp, int *flags, int *retval);\n"
+                  "#endif\n\n"
+                  "/*\n * sys_execve() executes a new program.\n */\n",
+              )
+              replace_once(
+                  "fs/exec.c",
+                  "\tif (IS_ERR(filename))\n\t\treturn PTR_ERR(filename);\n\n"
+                  "\t/*\n\t * We move the actual failure",
+                  "\tif (IS_ERR(filename))\n\t\treturn PTR_ERR(filename);\n\n"
+                  "#ifdef CONFIG_KSU_SUSFS\n"
+                  "\tksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);\n"
+                  "#endif\n\n"
+                  "\t/*\n\t * We move the actual failure",
+              )
+              replace_once(
+                  "fs/exec.c",
+                  "\tfree_bprm(bprm);\n\tkfree(pathbuf);\n\tputname(filename);\n",
+                  "\tfree_bprm(bprm);\n\tkfree(pathbuf);\n"
+                  "#ifdef CONFIG_KSU_SUSFS\n"
+                  "\tksu_handle_post_execveat(&fd, &filename, &argv, &envp, &flags, &retval);\n"
+                  "#endif\n"
+                  "\tputname(filename);\n",
+              )
+              replace_once(
+                  "fs/exec.c",
+                  "out_ret:\n\tputname(filename);\n\treturn retval;\n",
+                  "out_ret:\n"
+                  "#ifdef CONFIG_KSU_SUSFS\n"
+                  "\tksu_handle_post_execveat(&fd, &filename, &argv, &envp, &flags, &retval);\n"
+                  "#endif\n"
+                  "\tputname(filename);\n\treturn retval;\n",
+              )
+
+          op = Path("fs/open.c").read_text()
+          if "ksu_handle_faccessat" not in op:
+              replace_once(
+                  "fs/open.c",
+                  "/*\n * access() needs to use the real uid/gid, not the effective uid/gid.\n",
+                  "#ifdef CONFIG_KSU_SUSFS\n"
+                  "__attribute__((hot))\n"
+                  "extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user,\n"
+                  "\t\tint *mode, int *flags);\n"
+                  "#endif\n\n"
+                  "/*\n * access() needs to use the real uid/gid, not the effective uid/gid.\n",
+              )
+              replace_once(
+                  "fs/open.c",
+                  "\tint res;\n\tunsigned int lookup_flags = LOOKUP_FOLLOW;\n\n"
+                  "\tif (mode & ~S_IRWXO)",
+                  "\tint res;\n\tunsigned int lookup_flags = LOOKUP_FOLLOW;\n\n"
+                  "#ifdef CONFIG_KSU_SUSFS\n"
+                  "\tksu_handle_faccessat(&dfd, &filename, &mode, NULL);\n"
+                  "#endif\n\n"
+                  "\tif (mode & ~S_IRWXO)",
+              )
+
+          st = Path("fs/stat.c").read_text()
+          if "ksu_handle_stat" not in st:
+              replace_once(
+                  "fs/stat.c",
+                  "#if !defined(__ARCH_WANT_STAT64) || defined(__ARCH_WANT_SYS_NEWFSTATAT)\n",
+                  "#ifdef CONFIG_KSU_SUSFS\n"
+                  "__attribute__((hot))\n"
+                  "extern int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags);\n"
+                  "#endif\n\n"
+                  "#if !defined(__ARCH_WANT_STAT64) || defined(__ARCH_WANT_SYS_NEWFSTATAT)\n",
+              )
+              replace_once(
+                  "fs/stat.c",
+                  "\tstruct kstat stat;\n\tint error;\n\n"
+                  "\terror = vfs_fstatat(dfd, filename, &stat, flag);\n",
+                  "\tstruct kstat stat;\n\tint error;\n\n"
+                  "#ifdef CONFIG_KSU_SUSFS\n"
+                  "\tksu_handle_stat(&dfd, &filename, &flag);\n"
+                  "#endif\n"
+                  "\terror = vfs_fstatat(dfd, filename, &stat, flag);\n",
+              )
+              # The same body shape occurs again in fstatat64; patch its local
+              # region explicitly so 32-bit su/32-on-64 follows the same path.
+              p = Path("fs/stat.c")
+              text = p.read_text()
+              marker = "SYSCALL_DEFINE4(fstatat64, int, dfd, const char __user *, filename,"
+              pos = text.find(marker)
+              if pos >= 0:
+                  tail = text[pos:]
+                  old = "\tstruct kstat stat;\n\tint error;\n\n\terror = vfs_fstatat(dfd, filename, &stat, flag);\n"
+                  new = (
+                      "\tstruct kstat stat;\n\tint error;\n\n"
+                      "#ifdef CONFIG_KSU_SUSFS\n"
+                      "\tksu_handle_stat(&dfd, &filename, &flag);\n"
+                      "#endif\n"
+                      "\terror = vfs_fstatat(dfd, filename, &stat, flag);\n"
+                  )
+                  if old in tail and new not in tail:
+                      tail = tail.replace(old, new, 1)
+                      p.write_text(text[:pos] + tail)
+
+          required = {
+              "kernel/sys.c": "ksu_handle_setresuid",
+              "kernel/reboot.c": "ksu_handle_sys_reboot",
+              "fs/read_write.c": "ksu_handle_sys_read",
+              "drivers/input/input.c": "ksu_handle_input_handle_event",
+              "fs/exec.c": "ksu_handle_execveat",
+              "fs/open.c": "ksu_handle_faccessat",
+              "fs/stat.c": "ksu_handle_stat",
+          }
+          missing = [f"{p}:{sym}" for p, sym in required.items() if sym not in Path(p).read_text()]
+          if missing:
+              raise SystemExit("Missing ReSukiSU inline hooks after adaptation: " + ", ".join(missing))
+
+          forbidden = {
+              "fs/read_write.c": ("ksu_vfs_read_hook", "ksu_init_rc_hook"),
+              "drivers/input/input.c": ("ksu_input_hook",),
+              "fs/exec.c": ("ksu_execveat_hook",),
+              "fs/stat.c": ("ksu_init_rc_hook",),
+          }
+          bad = []
+          for p, symbols in forbidden.items():
+              text = Path(p).read_text()
+              bad += [f"{p}:{sym}" for sym in symbols if sym in text]
+          if bad:
+              raise SystemExit("Old/incompatible KernelSU hooks remain: " + ", ".join(bad))
+
+          print("ReSukiSU SUSFS inline hooks verified for A032F stock 4.14")
+          PY
+
+          git diff --check
+          git -C KernelSU diff --check
+          grep -n 'ksu_handle_setresuid' kernel/sys.c
+          grep -n 'ksu_handle_sys_reboot' kernel/reboot.c
+          grep -n 'ksu_handle_sys_read' fs/read_write.c
+          grep -n 'ksu_handle_input_handle_event' drivers/input/input.c
+          grep -n 'ksu_handle_execveat' fs/exec.c
+          grep -n 'ksu_handle_faccessat' fs/open.c
+          grep -n 'ksu_handle_stat' fs/stat.c
+
+      - name: Cache Android toolchains
+        uses: actions/cache@v4
+        with:
+          path: toolchains
+          key: a032f-r383902-gcc49-ee0dbcb-v1
+
+      - name: Install Samsung-matching Android toolchains
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p toolchains/clang-r383902 toolchains/gcc49
+
+          if [ ! -x toolchains/clang-r383902/bin/clang ]; then
+            # Stock A032FXXS9CZA1 reports Android clang 11.0.1, build 6443078.
+            # Gitiles archive endpoints occasionally return transient HTTP 404/5xx,
+            # so retry r383902 and fall back to the sibling r383902b archive from
+            # the same immutable AOSP prebuilt revision.
+            CLANG_BASE="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/0e9e7035bf8ad42437c6156e5950eab13655b26c"
+            if ! curl -fL --retry 5 --retry-delay 2 --retry-all-errors \
+              "$CLANG_BASE/clang-r383902.tar.gz" -o clang.tar.gz; then
+              curl -fL --retry 5 --retry-delay 2 --retry-all-errors \
+                "$CLANG_BASE/clang-r383902b.tar.gz" -o clang.tar.gz
+            fi
+            tar -xf clang.tar.gz -C toolchains/clang-r383902
+            rm clang.tar.gz
+          fi
+
+          if [ ! -x toolchains/gcc49/bin/aarch64-linux-android-gcc ]; then
+            # Samsung's source build script uses aarch64-linux-android-4.9.
+            wget -q \
+              "https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/+archive/ee0dbcb97f44a609dbfb354e63e05e305031365b.tar.gz" \
+              -O gcc49.tar.gz
+            tar -xf gcc49.tar.gz -C toolchains/gcc49
+            rm gcc49.tar.gz
+          fi
+
+          echo "${GITHUB_WORKSPACE}/toolchains/clang-r383902/bin" >> "$GITHUB_PATH"
+          echo "${GITHUB_WORKSPACE}/toolchains/gcc49/bin" >> "$GITHUB_PATH"
+
+          "${GITHUB_WORKSPACE}/toolchains/clang-r383902/bin/clang" --version | head -n 1
+          test -x "${GITHUB_WORKSPACE}/toolchains/gcc49/bin/aarch64-linux-android-gcc"
+
+      - name: Save Android toolchains cache
+        uses: actions/cache/save@v4
+        with:
+          path: toolchains
+          key: a032f-r383902-gcc49-ee0dbcb-v1
+
+      - name: Configure from Samsung A032F stock defconfig
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          export PATH="${GITHUB_WORKSPACE}/toolchains/clang-r383902/bin:${GITHUB_WORKSPACE}/toolchains/gcc49/bin:$PATH"
+          export CROSS_COMPILE="${GITHUB_WORKSPACE}/toolchains/gcc49/bin/aarch64-linux-android-"
+          export CLANG_TRIPLE=aarch64-linux-gnu-
+          export CC=clang
+          export LD=ld.lld
+          export DTC_OVERLAY_TEST_EXT="${GITHUB_WORKSPACE}/tools/mkdtimg/ufdt_apply_overlay"
+          export DTC_OVERLAY_VTS_EXT="${GITHUB_WORKSPACE}/tools/mkdtimg/ufdt_verify_overlay_host"
+
+          make -C "$KERNEL_ROOT" O="$OUT" \
+            BSP_BUILD_DT_OVERLAY=y ARCH="$ARCH" CC="$CC" LD="$LD" \
+            CROSS_COMPILE="$CROSS_COMPILE" CLANG_TRIPLE="$CLANG_TRIPLE" \
+            a3core_eur_open_defconfig
+
+          chmod +x scripts/config
+          scripts/config --file "$OUT/.config" -e KSU
+          scripts/config --file "$OUT/.config" -e KSU_SUSFS
+          scripts/config --file "$OUT/.config" -d KSU_TRACEPOINT_HOOK || true
+          scripts/config --file "$OUT/.config" -d KSU_MANUAL_HOOK || true
+          scripts/config --file "$OUT/.config" -d KSU_DEBUG || true
+          scripts/config --file "$OUT/.config" --set-str LOCALVERSION ""
+
+          make -C "$KERNEL_ROOT" O="$OUT" \
+            BSP_BUILD_DT_OVERLAY=y ARCH="$ARCH" CC="$CC" LD="$LD" \
+            CROSS_COMPILE="$CROSS_COMPILE" CLANG_TRIPLE="$CLANG_TRIPLE" \
+            LOCALVERSION="$LOCALVERSION" olddefconfig
+
+          grep -q '^CONFIG_KSU=y$' "$OUT/.config"
+          grep -q '^CONFIG_KSU_SUSFS=y$' "$OUT/.config"
+          grep -q '^CONFIG_MODULES=y$' "$OUT/.config"
+          grep -q '^CONFIG_MODVERSIONS=y$' "$OUT/.config"
+          grep -q '^CONFIG_KPROBES=y$' "$OUT/.config"
+
+          echo "===== ReSukiSU / SUSFS config ====="
+          grep -E '^CONFIG_KSU|^# CONFIG_KSU' "$OUT/.config" || true
+
+      - name: Verify Wi-Fi/module-compatible kernel release
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          export PATH="${GITHUB_WORKSPACE}/toolchains/clang-r383902/bin:${GITHUB_WORKSPACE}/toolchains/gcc49/bin:$PATH"
+          export CROSS_COMPILE="${GITHUB_WORKSPACE}/toolchains/gcc49/bin/aarch64-linux-android-"
+          export CLANG_TRIPLE=aarch64-linux-gnu-
+          export CC=clang
+          export LD=ld.lld
+
+          KERNEL_RELEASE="$(make -s -C "$KERNEL_ROOT" O="$OUT" \
+            ARCH="$ARCH" CC="$CC" LD="$LD" CROSS_COMPILE="$CROSS_COMPILE" \
+            CLANG_TRIPLE="$CLANG_TRIPLE" LOCALVERSION="$LOCALVERSION" kernelrelease)"
+
+          echo "KERNEL_RELEASE=$KERNEL_RELEASE" >> "$GITHUB_ENV"
+          echo "Kernel release: $KERNEL_RELEASE"
+
+          if [ "$KERNEL_RELEASE" != "$STOCK_KERNEL_RELEASE" ]; then
+            echo "::error::Kernel release differs from the stock S9 boot image; refusing to build a Wi-Fi-risky image."
+            exit 1
+          fi
+
+      - name: Build Image
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          export PATH="${GITHUB_WORKSPACE}/toolchains/clang-r383902/bin:${GITHUB_WORKSPACE}/toolchains/gcc49/bin:$PATH"
+          export CROSS_COMPILE="${GITHUB_WORKSPACE}/toolchains/gcc49/bin/aarch64-linux-android-"
+          export CLANG_TRIPLE=aarch64-linux-gnu-
+          export CC=clang
+          export LD=ld.lld
+          export DTC_OVERLAY_TEST_EXT="${GITHUB_WORKSPACE}/tools/mkdtimg/ufdt_apply_overlay"
+          export DTC_OVERLAY_VTS_EXT="${GITHUB_WORKSPACE}/tools/mkdtimg/ufdt_verify_overlay_host"
+
+          # This vendor DTC snapshot references YAML output without linking
+          # libyaml. Samsung's kernel build does not need the YAML emitter.
+          sed -i '/yamltree.o/d' scripts/dtc/Makefile
+          sed -i '/dt_to_yaml/d' scripts/dtc/dtc.c
+
+          make -C "$KERNEL_ROOT" O="$OUT" -j"$(nproc)" \
+            BSP_BUILD_DT_OVERLAY=y ARCH="$ARCH" CC="$CC" LD="$LD" \
+            CROSS_COMPILE="$CROSS_COMPILE" CLANG_TRIPLE="$CLANG_TRIPLE" \
+            LOCALVERSION="$LOCALVERSION" Image
+
+          test -s "$OUT/arch/arm64/boot/Image"
+          strings "$OUT/arch/arm64/boot/Image" | grep -m1 '^Linux version 4\.14\.199-27418755-abA032FXXS9CZA1 ' || {
+            echo "::error::Built Image does not contain the expected stock-compatible Linux release string."
+            exit 1
+          }
+
+      - name: Write build metadata
+        shell: bash
+        run: |
+          {
+            echo "source_branch=stock"
+            echo "source_commit=$(git rev-parse HEAD)"
+            echo "kernel_release=${KERNEL_RELEASE}"
+            echo "resukisu_sha=${RESUKISU_SHA}"
+            echo "susfs_sha=${SUSFS_SHA}"
+            echo "susfs_version=${SUSFS_VERSION}"
+            "${GITHUB_WORKSPACE}/toolchains/clang-r383902/bin/clang" --version | head -n 1 | sed 's/^/clang=/'
+          } | tee "$OUT/build-info.txt"
+
+      - name: Upload kernel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: A032F-S9-ReSukiSU-SUSFS
+          path: |
+            ${{ github.workspace }}/out/arch/arm64/boot/Image
+            ${{ github.workspace }}/out/.config
+            ${{ github.workspace }}/out/Module.symvers
+            ${{ github.workspace }}/out/build-info.txt
+          if-no-files-found: error
+          retention-days: 14
