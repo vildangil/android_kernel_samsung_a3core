@@ -254,33 +254,25 @@ jobs:
               seg = seg.replace(needle, needle + hook, 1)
               p.write_text(t[:start] + seg + t[end:])
 
-          # Samsung's fanotify callback is stock/two-argument, but after the
-          # SUSFS show_fdinfo hunk CONFIG_KSU_SUSFS_SUS_MOUNT passes file too.
-          # Match whitespace/formatted declarations robustly because vendor
-          # trees and patch versions do not always keep it on one line.
-          import re
+          # Samsung's fanotify callback is stock/two-argument, but the
+          # SUSFS fdinfo hunk calls it with file under CONFIG_KSU_SUSFS_SUS_MOUNT.
+          # This vendor tree keeps the declaration on one line, so use an exact,
+          # fail-closed replacement instead of a fragile regex.
           p = Path("fs/notify/fdinfo.c")
           t = p.read_text()
-          three_arg = re.compile(
-              r"static\\s+void\\s+fanotify_fdinfo\\(\\s*struct\\s+seq_file\\s*\\*m\\s*,"
-              r"\\s*struct\\s+fsnotify_mark\\s*\\*mark\\s*,\\s*struct\\s+file\\s*\\*file\\s*\\)"
-          )
-          if not three_arg.search(t):
-              two_arg = re.compile(
-                  r"static\\s+void\\s+fanotify_fdinfo\\(\\s*struct\\s+seq_file\\s*\\*m\\s*,"
-                  r"\\s*struct\\s+fsnotify_mark\\s*\\*mark\\s*\\)"
-              )
+          three_arg = "static void fanotify_fdinfo(struct seq_file *m, struct fsnotify_mark *mark, struct file *file)"
+          two_arg = "static void fanotify_fdinfo(struct seq_file *m, struct fsnotify_mark *mark)"
+          if three_arg not in t:
+              if t.count(two_arg) != 1:
+                  pos = t.find("fanotify_fdinfo")
+                  context = t[max(0, pos - 200):pos + 300] if pos >= 0 else "<not present>"
+                  raise SystemExit("fs/notify/fdinfo.c: cannot adapt fanotify_fdinfo:\n" + context)
               new = """#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
           static void fanotify_fdinfo(struct seq_file *m, struct fsnotify_mark *mark, struct file *file)
           #else
           static void fanotify_fdinfo(struct seq_file *m, struct fsnotify_mark *mark)
           #endif"""
-              t, n = two_arg.subn(new, t, count=1)
-              if n != 1:
-                  pos = t.find("fanotify_fdinfo")
-                  context = t[max(0, pos - 200):pos + 300] if pos >= 0 else "<not present>"
-                  raise SystemExit("fs/notify/fdinfo.c: cannot adapt fanotify_fdinfo:\n" + context)
-              p.write_text(t)
+              p.write_text(t.replace(two_arg, new, 1))
 
           for rel in expected:
               Path(rel).unlink()
