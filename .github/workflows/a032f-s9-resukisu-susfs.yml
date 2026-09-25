@@ -4,9 +4,6 @@ on:
   workflow_dispatch:
   schedule:
     - cron: '17 3 * * 0'
-  pull_request:
-    paths:
-      - .github/workflows/a032f-s9-resukisu-susfs.yml
   push:
     branches:
       - chatgpt/a032f-s9-resukisu-susfs
@@ -373,7 +370,7 @@ jobs:
           }
           #endif
           """
-          compat = compat.replace("\n          ", "\n").lstrip()
+          compat = compat.replace(r"\\t", "\t").replace("\n          ", "\n").lstrip()
           p.write_text(t[:start] + compat + t[end:])
 
           # ReSukiSU main uses the newer SUSFS per-task helpers.  The legacy
