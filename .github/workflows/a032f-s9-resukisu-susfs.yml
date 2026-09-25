@@ -370,7 +370,7 @@ jobs:
           }
           #endif
           """
-          compat = compat.replace(r"\\t", "\t").replace("\n          ", "\n").lstrip()
+          compat = compat.replace(r"\t", "	").replace("\n          ", "\n").lstrip()
           p.write_text(t[:start] + compat + t[end:])
 
           # ReSukiSU main uses the newer SUSFS per-task helpers.  The legacy
