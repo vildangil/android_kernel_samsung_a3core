@@ -292,12 +292,40 @@ jobs:
               if new in text:
                   return
               if old not in text:
-                  raise SystemExit(f"{path}: expected anchor not found")
+                  raise SystemExit(f"{path}: expected anchor not found: {old[:80]!r}")
               p.write_text(text.replace(old, new, 1))
 
-          # ReSukiSU's SUSFS inline mode intentionally rejects the old
-          # ksu_init_rc_hook / ksu_input_hook boolean-gated hooks.  For this
-          # Linux 4.14 tree, wire the current handlers directly instead.
+          # ReSukiSU currently uses struct filename** for SUSFS faccess/stat.
+          # On this Linux 4.14 tree the syscall hooks still expose user pointers,
+          # so use ReSukiSU's legacy implementation for < 6.1 while keeping its
+          # modern implementation intact for newer kernels.
+          replace_once(
+              "KernelSU/kernel/feature/sucompat.h",
+              "#ifdef CONFIG_KSU_SUSFS\n"
+              "int ksu_handle_faccessat(int *dfd, struct filename **filename, int *mode, int *__unused_flags);\n"
+              "int ksu_handle_stat(int *dfd, struct filename **filename, int *flags);\n",
+              "#if defined(CONFIG_KSU_SUSFS) && LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)\n"
+              "int ksu_handle_faccessat(int *dfd, struct filename **filename, int *mode, int *__unused_flags);\n"
+              "int ksu_handle_stat(int *dfd, struct filename **filename, int *flags);\n",
+          )
+          replace_once(
+              "KernelSU/kernel/feature/sucompat.c",
+              "#ifdef CONFIG_KSU_SUSFS\n"
+              "int ksu_handle_faccessat(int *dfd, struct filename **filename, int *mode, int *__unused_flags)\n",
+              "#if defined(CONFIG_KSU_SUSFS) && LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)\n"
+              "int ksu_handle_faccessat(int *dfd, struct filename **filename, int *mode, int *__unused_flags)\n",
+          )
+          replace_once(
+              "KernelSU/kernel/feature/sucompat.c",
+              "#ifdef CONFIG_KSU_SUSFS\n"
+              "int ksu_handle_stat(int *dfd, struct filename **filename, int *flags)\n",
+              "#if defined(CONFIG_KSU_SUSFS) && LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)\n"
+              "int ksu_handle_stat(int *dfd, struct filename **filename, int *flags)\n",
+          )
+
+          # ReSukiSU SUSFS-inline mode must use the current direct handlers;
+          # the old boolean-gated KernelSU hooks are explicitly rejected by
+          # ReSukiSU's inline_hook_check.mk.
 
           sysc = Path("kernel/sys.c").read_text()
           if "ksu_handle_setresuid" not in sysc:
@@ -379,6 +407,114 @@ jobs:
                   "\tif (is_event_supported(type, dev->evbit, EV_MAX)) {\n",
               )
 
+          ex = Path("fs/exec.c").read_text()
+          if "ksu_handle_execveat" not in ex:
+              replace_once(
+                  "fs/exec.c",
+                  "/*\n * sys_execve() executes a new program.\n */\n",
+                  "#ifdef CONFIG_KSU_SUSFS\n"
+                  "__attribute__((hot))\n"
+                  "extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr,\n"
+                  "\t\tvoid *argv, void *envp, int *flags);\n"
+                  "__attribute__((hot))\n"
+                  "extern int ksu_handle_post_execveat(int *fd, struct filename **filename_ptr,\n"
+                  "\t\tvoid *argv, void *envp, int *flags, int *retval);\n"
+                  "#endif\n\n"
+                  "/*\n * sys_execve() executes a new program.\n */\n",
+              )
+              replace_once(
+                  "fs/exec.c",
+                  "\tif (IS_ERR(filename))\n\t\treturn PTR_ERR(filename);\n\n"
+                  "\t/*\n\t * We move the actual failure",
+                  "\tif (IS_ERR(filename))\n\t\treturn PTR_ERR(filename);\n\n"
+                  "#ifdef CONFIG_KSU_SUSFS\n"
+                  "\tksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);\n"
+                  "#endif\n\n"
+                  "\t/*\n\t * We move the actual failure",
+              )
+              replace_once(
+                  "fs/exec.c",
+                  "\tfree_bprm(bprm);\n\tkfree(pathbuf);\n\tputname(filename);\n",
+                  "\tfree_bprm(bprm);\n\tkfree(pathbuf);\n"
+                  "#ifdef CONFIG_KSU_SUSFS\n"
+                  "\tksu_handle_post_execveat(&fd, &filename, &argv, &envp, &flags, &retval);\n"
+                  "#endif\n"
+                  "\tputname(filename);\n",
+              )
+              replace_once(
+                  "fs/exec.c",
+                  "out_ret:\n\tputname(filename);\n\treturn retval;\n",
+                  "out_ret:\n"
+                  "#ifdef CONFIG_KSU_SUSFS\n"
+                  "\tksu_handle_post_execveat(&fd, &filename, &argv, &envp, &flags, &retval);\n"
+                  "#endif\n"
+                  "\tputname(filename);\n\treturn retval;\n",
+              )
+
+          op = Path("fs/open.c").read_text()
+          if "ksu_handle_faccessat" not in op:
+              replace_once(
+                  "fs/open.c",
+                  "/*\n * access() needs to use the real uid/gid, not the effective uid/gid.\n",
+                  "#ifdef CONFIG_KSU_SUSFS\n"
+                  "__attribute__((hot))\n"
+                  "extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user,\n"
+                  "\t\tint *mode, int *flags);\n"
+                  "#endif\n\n"
+                  "/*\n * access() needs to use the real uid/gid, not the effective uid/gid.\n",
+              )
+              replace_once(
+                  "fs/open.c",
+                  "\tint res;\n\tunsigned int lookup_flags = LOOKUP_FOLLOW;\n\n"
+                  "\tif (mode & ~S_IRWXO)",
+                  "\tint res;\n\tunsigned int lookup_flags = LOOKUP_FOLLOW;\n\n"
+                  "#ifdef CONFIG_KSU_SUSFS\n"
+                  "\tksu_handle_faccessat(&dfd, &filename, &mode, NULL);\n"
+                  "#endif\n\n"
+                  "\tif (mode & ~S_IRWXO)",
+              )
+
+          st = Path("fs/stat.c").read_text()
+          if "ksu_handle_stat" not in st:
+              replace_once(
+                  "fs/stat.c",
+                  "#if !defined(__ARCH_WANT_STAT64) || defined(__ARCH_WANT_SYS_NEWFSTATAT)\n",
+                  "#ifdef CONFIG_KSU_SUSFS\n"
+                  "__attribute__((hot))\n"
+                  "extern int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags);\n"
+                  "#endif\n\n"
+                  "#if !defined(__ARCH_WANT_STAT64) || defined(__ARCH_WANT_SYS_NEWFSTATAT)\n",
+              )
+              replace_once(
+                  "fs/stat.c",
+                  "\tstruct kstat stat;\n\tint error;\n\n"
+                  "\terror = vfs_fstatat(dfd, filename, &stat, flag);\n",
+                  "\tstruct kstat stat;\n\tint error;\n\n"
+                  "#ifdef CONFIG_KSU_SUSFS\n"
+                  "\tksu_handle_stat(&dfd, &filename, &flag);\n"
+                  "#endif\n"
+                  "\terror = vfs_fstatat(dfd, filename, &stat, flag);\n",
+              )
+              # The same body shape occurs again in fstatat64; patch its local
+              # region explicitly so 32-bit su/32-on-64 follows the same path.
+              p = Path("fs/stat.c")
+              text = p.read_text()
+              marker = "SYSCALL_DEFINE4(fstatat64, int, dfd, const char __user *, filename,"
+              pos = text.find(marker)
+              if pos >= 0:
+                  tail = text[pos:]
+                  old = "\tstruct kstat stat;\n\tint error;\n\n\terror = vfs_fstatat(dfd, filename, &stat, flag);\n"
+                  new = (
+                      "\tstruct kstat stat;\n\tint error;\n\n"
+                      "#ifdef CONFIG_KSU_SUSFS\n"
+                      "\tksu_handle_stat(&dfd, &filename, &flag);\n"
+                      "#endif\n"
+                      "\terror = vfs_fstatat(dfd, filename, &stat, flag);\n"
+                  )
+                  if old in tail and new not in tail:
+                      tail = tail.replace(old, new, 1)
+                      p.write_text(text[:pos] + tail)
+
           required = {
               "kernel/sys.c": "ksu_handle_setresuid",
               "kernel/reboot.c": "ksu_handle_sys_reboot",
@@ -390,7 +526,7 @@ jobs:
           }
           missing = [f"{p}:{sym}" for p, sym in required.items() if sym not in Path(p).read_text()]
           if missing:
-              raise SystemExit("Missing ReSukiSU inline hooks after SUSFS patch: " + ", ".join(missing))
+              raise SystemExit("Missing ReSukiSU inline hooks after adaptation: " + ", ".join(missing))
 
           forbidden = {
               "fs/read_write.c": ("ksu_vfs_read_hook", "ksu_init_rc_hook"),
@@ -409,10 +545,14 @@ jobs:
           PY
 
           git diff --check
+          git -C KernelSU diff --check
           grep -n 'ksu_handle_setresuid' kernel/sys.c
           grep -n 'ksu_handle_sys_reboot' kernel/reboot.c
           grep -n 'ksu_handle_sys_read' fs/read_write.c
           grep -n 'ksu_handle_input_handle_event' drivers/input/input.c
+          grep -n 'ksu_handle_execveat' fs/exec.c
+          grep -n 'ksu_handle_faccessat' fs/open.c
+          grep -n 'ksu_handle_stat' fs/stat.c
 
       - name: Configure from Samsung A032F stock defconfig
         shell: bash
