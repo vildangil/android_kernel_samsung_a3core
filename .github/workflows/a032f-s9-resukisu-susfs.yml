@@ -439,6 +439,13 @@ jobs:
               "susfs_is_current_proc_umounted()",
               "!!(current->susfs_task_state & TASK_STRUCT_NON_ROOT_USER_APP_PROC)",
           )
+          # Current ReSukiSU starts the newer SUSFS sdcard monitor at boot complete.
+          # Legacy kernel-4.14 SUSFS v1.5.5 has no such backend; omit only this
+          # optional v2 helper while retaining the rest of boot-complete handling.
+          t = t.replace(
+              "#ifdef CONFIG_KSU_SUSFS\n                susfs_start_sdcard_monitor_fn();\n#endif\n",
+              "",
+          )
           p.write_text(t)
 
           forbidden = (
