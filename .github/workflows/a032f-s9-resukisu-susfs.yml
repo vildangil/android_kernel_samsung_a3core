@@ -461,6 +461,13 @@ jobs:
                       leftovers.append(f"{q}:{sym}")
           if leftovers:
               raise SystemExit("Legacy SUSFS compatibility leftovers: " + ", ".join(leftovers))
+
+          # Legacy 4.14 SUSFS lacks the reboot magic constant expected by current ReSukiSU.
+          p = Path("include/linux/susfs.h")
+          t = p.read_text()
+          if "SUSFS_MAGIC" not in t:
+              t += "\n#ifndef SUSFS_MAGIC\n#define SUSFS_MAGIC 0xFAFAFAFA\n#endif\n"
+              p.write_text(t)
           PY
 
           # The upstream 4.14 patch currently carries a few trailing spaces.
