@@ -2,6 +2,11 @@ name: Build A032F S9 ReSukiSU + SUSFS
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: '17 3 * * 0'
+  pull_request:
+    paths:
+      - .github/workflows/a032f-s9-resukisu-susfs.yml
   push:
     branches:
       - chatgpt/a032f-s9-resukisu-susfs
@@ -35,6 +40,7 @@ jobs:
       - name: Checkout stock 4.14.199 source
         uses: actions/checkout@v4
         with:
+          ref: stock
           fetch-depth: 1
 
       - name: Install build dependencies
@@ -273,6 +279,141 @@ jobs:
           echo "SUSFS_VERSION=$SUSFS_VERSION" >> "$GITHUB_ENV"
           echo "SUSFS version: $SUSFS_VERSION"
 
+      - name: Patch missing ReSukiSU SUSFS inline hooks
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace_once(path, old, new):
+              p = Path(path)
+              text = p.read_text()
+              if new in text:
+                  return
+              if old not in text:
+                  raise SystemExit(f"{path}: expected anchor not found")
+              p.write_text(text.replace(old, new, 1))
+
+          # ReSukiSU's SUSFS inline mode intentionally rejects the old
+          # ksu_init_rc_hook / ksu_input_hook boolean-gated hooks.  For this
+          # Linux 4.14 tree, wire the current handlers directly instead.
+
+          sysc = Path("kernel/sys.c").read_text()
+          if "ksu_handle_setresuid" not in sysc:
+              replace_once(
+                  "kernel/sys.c",
+                  "/*\n * This function implements a generic ability to update ruid, euid,\n",
+                  "#ifdef CONFIG_KSU_SUSFS\n"
+                  "extern int ksu_handle_setresuid(uid_t ruid, uid_t euid, uid_t suid);\n"
+                  "#endif\n\n"
+                  "/*\n * This function implements a generic ability to update ruid, euid,\n",
+              )
+              replace_once(
+                  "kernel/sys.c",
+                  "\tkuid_t kruid, keuid, ksuid;\n\n\tkruid = make_kuid(ns, ruid);\n",
+                  "\tkuid_t kruid, keuid, ksuid;\n\n"
+                  "#ifdef CONFIG_KSU_SUSFS\n"
+                  "\t(void)ksu_handle_setresuid(ruid, euid, suid);\n"
+                  "#endif\n\n"
+                  "\tkruid = make_kuid(ns, ruid);\n",
+              )
+
+          reboot = Path("kernel/reboot.c").read_text()
+          if "ksu_handle_sys_reboot" not in reboot:
+              replace_once(
+                  "kernel/reboot.c",
+                  "static DEFINE_MUTEX(reboot_mutex);\n",
+                  "static DEFINE_MUTEX(reboot_mutex);\n\n"
+                  "#ifdef CONFIG_KSU_SUSFS\n"
+                  "extern int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd, void __user **arg);\n"
+                  "#endif\n",
+              )
+              replace_once(
+                  "kernel/reboot.c",
+                  "\tchar buffer[256];\n\tint ret = 0;\n\n\t/* We only trust the superuser with rebooting the system. */\n",
+                  "\tchar buffer[256];\n\tint ret = 0;\n\n"
+                  "#ifdef CONFIG_KSU_SUSFS\n"
+                  "\tksu_handle_sys_reboot(magic1, magic2, cmd, &arg);\n"
+                  "#endif\n\n"
+                  "\t/* We only trust the superuser with rebooting the system. */\n",
+              )
+
+          rw = Path("fs/read_write.c").read_text()
+          if "ksu_handle_sys_read" not in rw:
+              replace_once(
+                  "fs/read_write.c",
+                  "SYSCALL_DEFINE3(read, unsigned int, fd, char __user *, buf, size_t, count)\n",
+                  "#ifdef CONFIG_KSU_SUSFS\n"
+                  "extern int ksu_handle_sys_read(unsigned int fd, char __user **buf_ptr, size_t *count_ptr);\n"
+                  "#endif\n\n"
+                  "SYSCALL_DEFINE3(read, unsigned int, fd, char __user *, buf, size_t, count)\n",
+              )
+              replace_once(
+                  "fs/read_write.c",
+                  "{\n\tstruct fd f = fdget_pos(fd);\n\tssize_t ret = -EBADF;\n\n\tif (f.file) {\n",
+                  "{\n\tstruct fd f = fdget_pos(fd);\n\tssize_t ret = -EBADF;\n\n"
+                  "#ifdef CONFIG_KSU_SUSFS\n"
+                  "\tksu_handle_sys_read(fd, &buf, &count);\n"
+                  "#endif\n\n"
+                  "\tif (f.file) {\n",
+              )
+
+          inp = Path("drivers/input/input.c").read_text()
+          if "ksu_handle_input_handle_event" not in inp:
+              replace_once(
+                  "drivers/input/input.c",
+                  "void input_event(struct input_dev *dev,\n",
+                  "#ifdef CONFIG_KSU_SUSFS\n"
+                  "extern int ksu_handle_input_handle_event(unsigned int *type, unsigned int *code, int *value);\n"
+                  "#endif\n\n"
+                  "void input_event(struct input_dev *dev,\n",
+              )
+              replace_once(
+                  "drivers/input/input.c",
+                  "{\n\tunsigned long flags;\n\n\tif (is_event_supported(type, dev->evbit, EV_MAX)) {\n",
+                  "{\n\tunsigned long flags;\n\n"
+                  "#ifdef CONFIG_KSU_SUSFS\n"
+                  "\tksu_handle_input_handle_event(&type, &code, &value);\n"
+                  "#endif\n\n"
+                  "\tif (is_event_supported(type, dev->evbit, EV_MAX)) {\n",
+              )
+
+          required = {
+              "kernel/sys.c": "ksu_handle_setresuid",
+              "kernel/reboot.c": "ksu_handle_sys_reboot",
+              "fs/read_write.c": "ksu_handle_sys_read",
+              "drivers/input/input.c": "ksu_handle_input_handle_event",
+              "fs/exec.c": "ksu_handle_execveat",
+              "fs/open.c": "ksu_handle_faccessat",
+              "fs/stat.c": "ksu_handle_stat",
+          }
+          missing = [f"{p}:{sym}" for p, sym in required.items() if sym not in Path(p).read_text()]
+          if missing:
+              raise SystemExit("Missing ReSukiSU inline hooks after SUSFS patch: " + ", ".join(missing))
+
+          forbidden = {
+              "fs/read_write.c": ("ksu_vfs_read_hook", "ksu_init_rc_hook"),
+              "drivers/input/input.c": ("ksu_input_hook",),
+              "fs/exec.c": ("ksu_execveat_hook",),
+              "fs/stat.c": ("ksu_init_rc_hook",),
+          }
+          bad = []
+          for p, symbols in forbidden.items():
+              text = Path(p).read_text()
+              bad += [f"{p}:{sym}" for sym in symbols if sym in text]
+          if bad:
+              raise SystemExit("Old/incompatible KernelSU hooks remain: " + ", ".join(bad))
+
+          print("ReSukiSU SUSFS inline hooks verified for A032F stock 4.14")
+          PY
+
+          git diff --check
+          grep -n 'ksu_handle_setresuid' kernel/sys.c
+          grep -n 'ksu_handle_sys_reboot' kernel/reboot.c
+          grep -n 'ksu_handle_sys_read' fs/read_write.c
+          grep -n 'ksu_handle_input_handle_event' drivers/input/input.c
+
       - name: Configure from Samsung A032F stock defconfig
         shell: bash
         run: |
@@ -370,7 +511,7 @@ jobs:
         run: |
           {
             echo "source_branch=stock"
-            echo "source_commit=${GITHUB_SHA}"
+            echo "source_commit=$(git rev-parse HEAD)"
             echo "kernel_release=${KERNEL_RELEASE}"
             echo "resukisu_sha=${RESUKISU_SHA}"
             echo "susfs_sha=${SUSFS_SHA}"
